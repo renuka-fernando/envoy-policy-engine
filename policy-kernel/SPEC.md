@@ -91,12 +91,20 @@ policy_kernel:
           params:
             log_response_body: true
 
-  validation_failure_response:
-    status_code: 502  # Bad Gateway (default)
-    body: '{"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}'
+  policy_not_supported_response:
+    status_code: 500  # Internal Server Error (default)
+    body: '{"error": "Policy configuration error", "code": "POLICY_NOT_SUPPORTED"}'
     headers:
       Content-Type: "application/json"
-      X-Policy-Error: "true"
+      X-Policy-Error: "configuration"
+
+  agent_unavailable_response:
+    status_code: 503  # Service Unavailable (default)
+    body: '{"error": "Policy service temporarily unavailable", "code": "AGENT_UNAVAILABLE"}'
+    headers:
+      Content-Type: "application/json"
+      X-Policy-Error: "temporary"
+      Retry-After: "30"
 
   observability:
     metrics_port: 9090
@@ -134,13 +142,17 @@ On startup and reload (static YAML configuration):
 
 ### 4.3 Validation Failure Response Configuration
 
-The `validation_failure_response` section configures the immediate error response returned when policy validation fails (i.e., when ANY policy in a route's chain is unsupported by available healthy agents).
+The kernel distinguishes between two types of policy validation failures and provides separate configurable responses for each:
+
+#### 4.3.1 Policy Not Supported Response
+
+The `policy_not_supported_response` configures the error response when a policy in the route's chain is **not supported by ANY agent** in the system (configuration error).
 
 **Configuration Schema:**
 
 ```yaml
-validation_failure_response:
-  status_code: 502           # HTTP status code (default: 502 Bad Gateway)
+policy_not_supported_response:
+  status_code: 500           # HTTP status code (default: 500 Internal Server Error)
   body: "..."                # Response body (string or JSON)
   headers:                   # Optional response headers
     header-name: "value"
@@ -148,49 +160,106 @@ validation_failure_response:
 
 **Default Values:**
 
-If not specified in configuration, the kernel uses these defaults:
-- **status_code**: `502` (Bad Gateway)
-- **body**: `'{"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}'`
+- **status_code**: `500` (Internal Server Error)
+- **body**: `'{"error": "Policy configuration error", "code": "POLICY_NOT_SUPPORTED"}'`
 - **headers**:
   - `Content-Type: "application/json"`
-  - `X-Policy-Error: "true"`
+  - `X-Policy-Error: "configuration"`
 
-**Rationale for 502 Bad Gateway:**
+**Rationale for 500 Internal Server Error:**
 
-The 502 Bad Gateway status code is appropriate because:
-- Indicates the kernel (acting as a gateway) received an invalid response from upstream agents
-- Signals to clients that the issue is with backend services (agents), not the request itself
-- Encourages retry behavior since it's a temporary service unavailability
-- Distinguishes from 503 Service Unavailable (which typically indicates complete service outage)
+- Indicates a **server configuration issue** - the route references a policy that no agent supports
+- This is **not a temporary condition** - it won't resolve until system configuration changes
+- Distinguishes from temporary service unavailability (503)
+- Signals to clients and operators that intervention is required
 
-**Configuration Examples:**
+**When This Response Is Used:**
+
+- A route's policy chain includes a policy name that no agent has ever declared support for
+- This represents a misconfiguration between route policies and available agents
+
+#### 4.3.2 Agent Unavailable Response
+
+The `agent_unavailable_response` configures the error response when a policy IS supported by at least one agent, but **all supporting agents are currently unhealthy** (temporary condition).
+
+**Configuration Schema:**
 
 ```yaml
-# Example 1: JSON error response (default)
-validation_failure_response:
-  status_code: 502
-  body: '{"error": "Policy enforcement unavailable", "code": "POLICY_UNAVAILABLE"}'
+agent_unavailable_response:
+  status_code: 503           # HTTP status code (default: 503 Service Unavailable)
+  body: "..."                # Response body (string or JSON)
+  headers:                   # Optional response headers
+    header-name: "value"
+```
+
+**Default Values:**
+
+- **status_code**: `503` (Service Unavailable)
+- **body**: `'{"error": "Policy service temporarily unavailable", "code": "AGENT_UNAVAILABLE"}'`
+- **headers**:
+  - `Content-Type: "application/json"`
+  - `X-Policy-Error: "temporary"`
+  - `Retry-After: "30"` (suggests retry after 30 seconds)
+
+**Rationale for 503 Service Unavailable:**
+
+- Indicates a **temporary condition** - agents are expected to recover
+- Standard semantic: the service is temporarily unable to handle the request
+- Encourages retry behavior (via `Retry-After` header)
+- Distinguishes from permanent configuration errors (500)
+
+**When This Response Is Used:**
+
+- A route's policy is supported by one or more agents in the system
+- All agents that support the policy are currently unhealthy (failed health checks)
+- This is expected to be temporary and may resolve as agents recover
+
+#### 4.3.3 Configuration Examples
+
+```yaml
+# Example 1: Default JSON responses
+policy_not_supported_response:
+  status_code: 500
+  body: '{"error": "Policy configuration error", "code": "POLICY_NOT_SUPPORTED"}'
+  headers:
+    Content-Type: "application/json"
+    X-Policy-Error: "configuration"
+
+agent_unavailable_response:
+  status_code: 503
+  body: '{"error": "Policy service temporarily unavailable", "code": "AGENT_UNAVAILABLE"}'
+  headers:
+    Content-Type: "application/json"
+    X-Policy-Error: "temporary"
+    Retry-After: "30"
+
+# Example 2: Custom error messages with different status codes
+policy_not_supported_response:
+  status_code: 500
+  body: '{"error": "Invalid policy configuration. Contact administrator.", "code": "CONFIG_ERROR"}'
   headers:
     Content-Type: "application/json"
 
-# Example 2: Plain text response
-validation_failure_response:
+agent_unavailable_response:
   status_code: 503
-  body: "Service temporarily unavailable. Please try again later."
+  body: '{"error": "Service maintenance in progress. Please retry.", "code": "MAINTENANCE"}'
+  headers:
+    Content-Type: "application/json"
+    Retry-After: "60"
+
+# Example 3: Plain text responses
+policy_not_supported_response:
+  status_code: 500
+  body: "Server configuration error. Please contact support."
   headers:
     Content-Type: "text/plain"
 
-# Example 3: HTML error page
-validation_failure_response:
-  status_code: 502
-  body: |
-    <!DOCTYPE html>
-    <html>
-    <head><title>Service Unavailable</title></head>
-    <body><h1>Service Temporarily Unavailable</h1></body>
-    </html>
+agent_unavailable_response:
+  status_code: 503
+  body: "Service temporarily unavailable. Please try again in 30 seconds."
   headers:
-    Content-Type: "text/html"
+    Content-Type: "text/plain"
+    Retry-After: "30"
 ```
 
 ### 4.4 Dynamic Configuration Validation (Future)
@@ -325,21 +394,24 @@ stateDiagram-v2
     RouteFound --> MapPoliciesToAgents: Partition policy chain
     MapPoliciesToAgents --> ValidateMapping: Find agents for each policy
 
-    ValidateMapping --> FullCoverage: All policies covered
-    ValidateMapping --> ValidationFailed: ANY policy unsupported
+    ValidateMapping --> FullCoverage: All policies have supporting agents
+    ValidateMapping --> PolicyNotSupported: Policy not supported by ANY agent
+    ValidateMapping --> AgentUnhealthy: Policy supported but all agents unhealthy
 
     FullCoverage --> ExecutePolicies: Execute across agents
-    ValidationFailed --> ImmediateResponse: Return configured error
+    PolicyNotSupported --> ErrorResponse500: Return 500 Internal Server Error
+    AgentUnhealthy --> ErrorResponse503: Return 503 Service Unavailable
 
     ExecutePolicies --> AggregateResults: Collect from all agents
     AggregateResults --> [*]
-    ImmediateResponse --> [*]
+    ErrorResponse500 --> [*]
+    ErrorResponse503 --> [*]
     Continue --> [*]
 
     note right of MapPoliciesToAgents
         For each policy:
-        - Find supporting agents
-        - Check agent health
+        - Check if ANY agent supports it
+        - Check supporting agents' health
         - Group by agent
         - Maintain execution order
     end note
@@ -350,11 +422,18 @@ stateDiagram-v2
         allow request through
     end note
 
-    note right of ValidationFailed
-        All-or-Nothing validation:
-        If ANY policy is unsupported,
-        return immediate response
-        (502 Bad Gateway by default)
+    note right of PolicyNotSupported
+        Configuration error:
+        Policy not declared by any agent
+        500 Internal Server Error
+        (policy_not_supported_response)
+    end note
+
+    note right of AgentUnhealthy
+        Temporary condition:
+        Policy supported but agents down
+        503 Service Unavailable
+        (agent_unavailable_response)
     end note
 
     note right of AggregateResults
@@ -369,14 +448,24 @@ stateDiagram-v2
 1. Extract `route_name` from Envoy request headers or metadata
 2. Lookup route in `route_policies` configuration
 3. **Route Not Found**: If route not found, return `CONTINUE` instruction to Envoy (no policy execution)
-4. Map each policy in `request_policy_chain` to available agents:
-   - Query agent registry for agents supporting each policy
-   - Filter by health status (only healthy agents)
-   - Verify ALL policies can be mapped to available agents
-5. **All-or-Nothing Validation**: Check if all policies in the chain are supported
-   - If ALL policies can be mapped to agents: Create execution plan grouping consecutive policies by agent
-   - If ANY policy is unsupported: Return `IMMEDIATE_RESPONSE` with configured `validation_failure_response` (log warning)
-6. Execute the validated policy chain across agents in the correct order
+4. **All-or-Nothing Validation**: For each policy in `request_policy_chain`, perform two-stage validation:
+
+   **Stage 1: Check if policy is supported by ANY agent**
+   - Query agent registry to find if ANY agent (healthy or unhealthy) declares support for this policy
+   - If NO agent supports the policy → **Configuration Error**
+     - Return `IMMEDIATE_RESPONSE` with `policy_not_supported_response` (500 Internal Server Error)
+     - Log error with unsupported policy names
+
+   **Stage 2: Check if supporting agents are healthy**
+   - Filter supporting agents by health status (only healthy agents)
+   - If policy is supported but ALL supporting agents are unhealthy → **Temporary Unavailability**
+     - Return `IMMEDIATE_RESPONSE` with `agent_unavailable_response` (503 Service Unavailable)
+     - Log warning with unhealthy agent names
+
+   **Success: All policies have healthy supporting agents**
+   - Create execution plan grouping consecutive policies by agent
+
+5. Execute the validated policy chain across agents in the correct order
 
 **Important**: The order of agent execution follows the policy chain order. This may result in calling the same agent multiple times in non-sequential order (e.g., agent1 → agent2 → agent1 → agent3).
 
@@ -399,12 +488,18 @@ Execution Plan:
 
 1. Use the same route matched during request phase
 2. **Route Not Found or No Response Chain**: If route not found or no response chain configured, return `CONTINUE` instruction to Envoy
-3. Map each policy in `response_policy_chain` to available agents (same logic as request phase)
-4. **All-or-Nothing Validation**: Check if all policies in the response chain are supported
-   - If ALL policies can be mapped to agents: Create execution plan
-   - If ANY policy is unsupported: Return `IMMEDIATE_RESPONSE` with configured `validation_failure_response` (log warning)
-5. Execute the validated response policy chain across agents in the correct order
-6. Aggregate responses from all agents
+3. **All-or-Nothing Validation**: Apply same two-stage validation as request phase (see section 6.2):
+
+   **Stage 1**: Check if each policy is supported by ANY agent
+   - If not → Return `IMMEDIATE_RESPONSE` with `policy_not_supported_response` (500)
+
+   **Stage 2**: Check if supporting agents are healthy
+   - If policy supported but all agents unhealthy → Return `IMMEDIATE_RESPONSE` with `agent_unavailable_response` (503)
+
+   **Success**: Create execution plan
+
+4. Execute the validated response policy chain across agents in the correct order
+5. Aggregate responses from all agents
 
 **Important**: The same non-sequential agent ordering applies to response phase (e.g., agent1 → agent2 → agent1).
 
@@ -445,20 +540,38 @@ Optimized Plan (3 calls):
 **Agent Selection Algorithm:**
 ```go
 func (k *Kernel) createExecutionPlan(policies []*Policy) ([]AgentPolicyGroup, error) {
-    // Phase 1: Validate ALL policies are supported (all-or-nothing check)
+    // Stage 1: Check if ALL policies are supported by at least one agent (configuration check)
     for _, policy := range policies {
-        agents := k.registry.FindAgentsForPolicy(policy.Name, true /* healthyOnly */)
-        if len(agents) == 0 {
-            return nil, fmt.Errorf("no healthy agent found for policy: %s - skipping entire policy chain", policy.Name)
+        allAgents := k.registry.FindAgentsForPolicy(policy.Name, false /* includeUnhealthy */)
+        if len(allAgents) == 0 {
+            // Configuration error: No agent (healthy or unhealthy) supports this policy
+            return nil, &PolicyNotSupportedError{
+                PolicyName: policy.Name,
+                Message: fmt.Sprintf("no agent declares support for policy: %s", policy.Name),
+            }
         }
     }
 
-    // Phase 2: Create execution plan (grouping optimization)
+    // Stage 2: Check if supporting agents are healthy (availability check)
+    for _, policy := range policies {
+        healthyAgents := k.registry.FindAgentsForPolicy(policy.Name, true /* healthyOnly */)
+        if len(healthyAgents) == 0 {
+            // Temporary unavailability: Policy supported but all agents unhealthy
+            unhealthyAgents := k.registry.FindAgentsForPolicy(policy.Name, false /* includeUnhealthy */)
+            return nil, &AgentUnavailableError{
+                PolicyName: policy.Name,
+                UnavailableAgents: unhealthyAgents,
+                Message: fmt.Sprintf("all agents supporting policy %s are unhealthy", policy.Name),
+            }
+        }
+    }
+
+    // Stage 3: Create execution plan (grouping optimization)
     plan := []AgentPolicyGroup{}
     var currentGroup *AgentPolicyGroup
 
     for _, policy := range policies {
-        // Find all healthy agents supporting this policy (guaranteed to exist after Phase 1)
+        // Find all healthy agents supporting this policy (guaranteed to exist after Stage 2)
         agents := k.registry.FindAgentsForPolicy(policy.Name, true /* healthyOnly */)
 
         // Try to extend current group if same agent can handle this policy
@@ -477,61 +590,99 @@ func (k *Kernel) createExecutionPlan(policies []*Policy) ([]AgentPolicyGroup, er
 
     return plan, nil
 }
+
+// Error types for distinguishing failure modes
+type PolicyNotSupportedError struct {
+    PolicyName string
+    Message    string
+}
+
+type AgentUnavailableError struct {
+    PolicyName        string
+    UnavailableAgents []*AgentEntry
+    Message           string
+}
 ```
 
 ### 6.5 All-or-Nothing Policy Validation
 
-The kernel enforces a strict **all-or-nothing validation policy** for route policy chains:
+The kernel enforces a strict **all-or-nothing validation policy** for route policy chains with differentiated error responses:
 
 **Validation Rules:**
 
-1. **Complete Coverage Required**: ALL policies in a route's policy chain MUST be supported by at least one healthy agent
-2. **No Partial Execution**: If ANY policy cannot be mapped to a healthy agent, the ENTIRE policy chain is skipped
-3. **Immediate Error Response**: When validation fails, the kernel returns an immediate error response (configured via `validation_failure_response`)
-4. **Applies to Both Phases**: This validation applies to both request and response policy chains independently
-5. **Unknown Route Behavior**: If route is not found in configuration, kernel returns `CONTINUE` (not a validation failure)
+1. **Complete Coverage Required**: ALL policies in a route's policy chain MUST be supported by at least one agent (healthy or unhealthy)
+2. **Health Check Required**: ALL policies MUST have at least one healthy agent available
+3. **No Partial Execution**: If ANY policy fails validation, the ENTIRE policy chain is skipped
+4. **Differentiated Error Responses**: Validation failures return different HTTP status codes based on failure type:
+   - **500 Internal Server Error**: Policy not supported by any agent (configuration error)
+   - **503 Service Unavailable**: Policy supported but all agents unhealthy (temporary condition)
+5. **Applies to Both Phases**: This validation applies to both request and response policy chains independently
+6. **Unknown Route Behavior**: If route is not found in configuration, kernel returns `CONTINUE` (not a validation failure)
 
 **Rationale:**
 
 This strict validation ensures:
-- **Predictable behavior**: Routes either execute completely as configured or fail explicitly with an error
+- **Predictable behavior**: Routes either execute completely as configured or fail explicitly with an appropriate error
 - **Security guarantees**: No partial policy enforcement that could leave security gaps
 - **Clear operational state**: No ambiguity about which policies were applied
-- **Fail-safe defaults**: 502 Bad Gateway clearly indicates a backend service issue
+- **Actionable error signals**: Different status codes guide different responses:
+  - 500 → Configuration fix required (permanent issue)
+  - 503 → Retry or wait for agent recovery (temporary issue)
 
 **Example Scenarios:**
 
 ```yaml
-# Scenario 1: All policies supported
+# Scenario 1: All policies supported and agents healthy
 Route: /api/v1/users
 Policy Chain: [apiKeyAuth, rateLimit, jwtValidation]
 Available Agents:
-  - auth-agent: [apiKeyAuth, jwtValidation]
-  - rate-limiter: [rateLimit]
+  - auth-agent: [apiKeyAuth, jwtValidation] (healthy)
+  - rate-limiter: [rateLimit] (healthy)
 Result: ✓ Execute full chain across agents
+Response: Normal policy execution
 
-# Scenario 2: One policy unsupported
+# Scenario 2: Policy not supported by any agent (Configuration Error)
 Route: /api/v1/admin
 Policy Chain: [jwtValidation, roleCheck, auditLog]
 Available Agents:
-  - auth-agent: [jwtValidation, roleCheck]
-  - (no agent supports auditLog)
-Result: ✗ Skip ENTIRE chain, return IMMEDIATE_RESPONSE (502 Bad Gateway)
-Response: {"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}
+  - auth-agent: [jwtValidation, roleCheck] (healthy)
+  - (NO agent declares support for auditLog)
+Result: ✗ Skip ENTIRE chain, return IMMEDIATE_RESPONSE
+Status: 500 Internal Server Error
+Response: {"error": "Policy configuration error", "code": "POLICY_NOT_SUPPORTED"}
+Error Type: PolicyNotSupportedError
+Action: Fix configuration - deploy agent supporting auditLog or remove from route
 
-# Scenario 3: Agent becomes unhealthy at runtime
+# Scenario 3: Agent unhealthy at runtime (Temporary Unavailability)
 Route: /api/v1/data
 Policy Chain: [auth, transform]
 Available Agents:
   - auth-agent: [auth] (healthy)
-  - transform-agent: [transform] (unhealthy)
-Result: ✗ Skip ENTIRE chain, return IMMEDIATE_RESPONSE (502 Bad Gateway)
-Response: {"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}
+  - transform-agent: [transform] (UNHEALTHY)
+Result: ✗ Skip ENTIRE chain, return IMMEDIATE_RESPONSE
+Status: 503 Service Unavailable
+Response: {"error": "Policy service temporarily unavailable", "code": "AGENT_UNAVAILABLE"}
+Headers: Retry-After: 30
+Error Type: AgentUnavailableError
+Action: Retry after agent recovers or investigate agent health
 
-# Scenario 4: Unknown route (not in configuration)
+# Scenario 4: All agents for a policy are unhealthy
+Route: /api/v1/secure
+Policy Chain: [auth, encrypt]
+Available Agents:
+  - auth-agent-1: [auth] (UNHEALTHY)
+  - auth-agent-2: [auth] (UNHEALTHY)
+  - encrypt-agent: [encrypt] (healthy)
+Result: ✗ Skip ENTIRE chain, return IMMEDIATE_RESPONSE
+Status: 503 Service Unavailable
+Response: {"error": "Policy service temporarily unavailable", "code": "AGENT_UNAVAILABLE"}
+Action: Wait for any auth-agent to recover
+
+# Scenario 5: Unknown route (not in configuration)
 Request to: /api/v1/unknown
 Route Configuration: (no match found)
 Result: ✓ CONTINUE (allow request through, no policy execution)
+Status: Pass-through (no immediate response)
 ```
 
 **Validation Timing:**
@@ -542,20 +693,36 @@ Result: ✓ CONTINUE (allow request through, no policy execution)
 
 **Logging:**
 
-When validation fails, the kernel logs a warning with details:
+When a policy is not supported by any agent (configuration error):
 ```json
 {
-  "level": "warning",
-  "message": "Policy chain validation failed - returning error response",
+  "level": "error",
+  "message": "Policy not supported by any agent - returning 500 error",
   "route": "/api/v1/admin",
   "unsupported_policies": ["auditLog"],
   "available_agents": ["auth-agent", "rate-limiter"],
-  "response_status": 502,
+  "error_type": "POLICY_NOT_SUPPORTED",
+  "response_status": 500,
   "action": "IMMEDIATE_RESPONSE"
 }
 ```
 
-When route is not found, the kernel logs an info message:
+When agents are unhealthy (temporary unavailability):
+```json
+{
+  "level": "warning",
+  "message": "All supporting agents unhealthy - returning 503 error",
+  "route": "/api/v1/data",
+  "affected_policies": ["transform"],
+  "unhealthy_agents": ["transform-agent"],
+  "error_type": "AGENT_UNAVAILABLE",
+  "response_status": 503,
+  "action": "IMMEDIATE_RESPONSE",
+  "retry_after": 30
+}
+```
+
+When route is not found:
 ```json
 {
   "level": "info",
@@ -730,10 +897,10 @@ sequenceDiagram
 | Policy execution failure | Depends on policy `on_failure` setting | DENY or CONTINUE based on policy config |
 | **Unknown route** | **No policy execution**, log info | **CONTINUE** (allow request through) |
 | Configuration reload failure | Continue with previous config, alert | N/A (runtime operation) |
-| **Unsupported policy in chain** | **Skip ENTIRE policy chain**, log warning | **IMMEDIATE_RESPONSE** (502 Bad Gateway by default) |
+| **Policy not supported by ANY agent** | **Skip ENTIRE chain**, log error | **500 Internal Server Error** (policy_not_supported_response) |
+| **Policy supported but all agents unhealthy** | **Skip ENTIRE chain**, log warning | **503 Service Unavailable** (agent_unavailable_response) |
 | **Multi-agent: Partial chain failure** | Stop chain, return aggregated results so far | CONTINUE or DENY based on `on_failure` config |
 | **Multi-agent: Agent failure mid-chain** | Stop chain, return aggregated results so far | CONTINUE or DENY based on `on_failure` config |
-| **Multi-agent: All agents unhealthy** | **Skip entire chain**, log warning | **IMMEDIATE_RESPONSE** (502 Bad Gateway by default) |
 
 ### 8.2 Multi-Agent Error Handling
 
@@ -1303,6 +1470,7 @@ go build -o policy-kernel ./cmd/kernel
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 1.3 | 2025-11-02 | System | Split validation failure response into two configurations: policy_not_supported_response (500) and agent_unavailable_response (503) to distinguish configuration errors from temporary unavailability |
 | 1.2 | 2025-11-02 | System | Replaced default_policy with validation_failure_response configuration (immediate error response) |
 | 1.1 | 2025-11-02 | System | Added multi-agent policy execution support with response aggregation |
 | 1.0 | 2025-11-02 | System | Extracted from v2.0 monolithic specification |
