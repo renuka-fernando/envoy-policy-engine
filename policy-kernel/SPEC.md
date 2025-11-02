@@ -115,15 +115,30 @@ policy_kernel:
 > - Version management and rollback capabilities
 > - Validation of dynamic policy updates against available agents
 
-### 4.2 Configuration Validation
+### 4.2 Startup Configuration Validation
 
-On startup and reload:
+On startup and reload (static YAML configuration):
 1. Validate YAML syntax
 2. Check agent socket paths exist
 3. Discover and load ALL configured agents
 4. Load route policies configuration
 5. Verify policy references match agent capabilities (validate against discovered agents)
 6. Validate parameter schemas for each policy
+
+**Startup Validation Behavior (Permissive):**
+- If some route policies reference unsupported policies: **Log errors, mark routes invalid, continue startup**
+- If all agents are unavailable: **Log critical error, continue startup** (all routes marked invalid)
+- Rationale: Prefer availability over strict correctness at startup to avoid complete system failure
+
+### 4.3 Dynamic Configuration Validation (Future)
+
+When route policies are loaded dynamically via management API:
+
+**Dynamic Validation Behavior (Strict):**
+- Validate new/updated route policy against currently discovered agents
+- If any policy in the chain is unsupported: **Log errors, mark routes invalid, continue startup**
+- If referenced agent is unavailable or unhealthy: **Log errors, mark routes invalid, continue startup**
+- If parameter schema validation fails: **Log errors, mark routes invalid, continue startup**
 
 ## 5. Agent Discovery and Registry
 
@@ -140,15 +155,13 @@ message GetAgentConfigResponse {
   string agent_name = 1;
   string agent_version = 2;
   repeated PolicyInfo supported_policies = 3;
-  map<string, string> agent_metadata = 4;
 }
 
 message PolicyInfo {
   string name = 1;
   string version = 2;
-  string description = 3;
-  repeated string param_schema = 4; // List of parameter names (e.g., ["headerName", "required"])
-  PolicyPhase supported_phases = 5;
+  repeated string param_schema = 3; // List of parameter names (e.g., ["headerName", "required"])
+  PolicyPhase supported_phases = 4;
 }
 
 enum PolicyPhase {
@@ -208,7 +221,6 @@ type AgentEntry struct {
     socketPath        string
     version           string
     supportedPolicies map[string]PolicyInfo  // policy name -> policy info
-    metadata          map[string]string
     connection        *grpc.ClientConn
     healthy           bool
     lastHealthCheck   time.Time
@@ -244,17 +256,17 @@ stateDiagram-v2
     ExtractRoute --> LookupRoute: Extract route_name
 
     LookupRoute --> RouteFound: Match found
-    LookupRoute --> DefaultPolicy: No match
+    LookupRoute --> Continue: No match
 
     RouteFound --> MapPoliciesToAgents: Partition policy chain
     MapPoliciesToAgents --> ValidateMapping: Find agents for each policy
 
     ValidateMapping --> FullCoverage: All policies covered
-    ValidateMapping --> PartialCoverage: Some policies unsupported
+    ValidateMapping --> PartialCoverage: ANY policy unsupported
     ValidateMapping --> NoCoverage: No agents available
 
     FullCoverage --> ExecutePolicies: Execute across agents
-    PartialCoverage --> ExecutePolicies: Execute supported policies
+    PartialCoverage --> DefaultPolicy: Fallback (all-or-nothing)
     NoCoverage --> DefaultPolicy: Fallback
 
     DefaultPolicy --> CheckDefault: Default configured?
@@ -274,6 +286,19 @@ stateDiagram-v2
         - Maintain execution order
     end note
 
+    note left of Continue
+        Unknown route:
+        No policy execution,
+        allow request through
+    end note
+
+    note right of PartialCoverage
+        All-or-Nothing validation:
+        If ANY policy is unsupported,
+        skip ENTIRE chain and
+        apply default policy
+    end note
+
     note right of AggregateResults
         Merge instructions from
         multiple agents in
@@ -285,14 +310,18 @@ stateDiagram-v2
 
 1. Extract `route_name` from Envoy request headers or metadata
 2. Lookup route in `route_policies` configuration
-3. Map each policy in `request_policy_chain` to available agents:
+3. **Route Not Found**: If route not found, return `CONTINUE` instruction to Envoy (no policy execution)
+4. Map each policy in `request_policy_chain` to available agents:
    - Query agent registry for agents supporting each policy
    - Filter by health status (only healthy agents)
-   - Create execution plan grouping consecutive policies by agent
-4. If all policies can be mapped to agents, execute the chain across agents
-5. If some policies cannot be mapped, execute supported policies only (log warning)
-6. If route not found, apply `default_policy.request_policy_chain` (if configured)
-7. If no default policy or no agents available, return `CONTINUE` instruction to Envoy
+   - Verify ALL policies can be mapped to available agents
+5. **All-or-Nothing Validation**: Check if all policies in the chain are supported
+   - If ALL policies can be mapped to agents: Create execution plan grouping consecutive policies by agent
+   - If ANY policy is unsupported: Skip entire policy chain, apply `default_policy.request_policy_chain` (log warning)
+6. Execute the validated policy chain across agents in the correct order
+7. If default policy cannot be executed (no agents available), return `CONTINUE` instruction to Envoy
+
+**Important**: The order of agent execution follows the policy chain order. This may result in calling the same agent multiple times in non-sequential order (e.g., agent1 → agent2 → agent1 → agent3).
 
 **Policy-to-Agent Mapping Example:**
 ```
@@ -312,10 +341,16 @@ Execution Plan:
 ### 6.3 Response Phase Selection
 
 1. Use the same route matched during request phase
-2. Map each policy in `response_policy_chain` to available agents (same logic as request phase)
-3. Execute associated `response_policy_chain` across agents
-4. Aggregate responses from all agents
-5. If route not found or no response chain configured, return `CONTINUE` instruction to Envoy
+2. **Route Not Found or No Response Chain**: If route not found or no response chain configured, return `CONTINUE` instruction to Envoy
+3. Map each policy in `response_policy_chain` to available agents (same logic as request phase)
+4. **All-or-Nothing Validation**: Check if all policies in the response chain are supported
+   - If ALL policies can be mapped to agents: Create execution plan
+   - If ANY policy is unsupported: Skip entire response policy chain, apply `default_policy.response_policy_chain` (log warning)
+5. Execute the validated response policy chain across agents in the correct order
+6. Aggregate responses from all agents
+7. If default policy cannot be executed (no agents available), return `CONTINUE` instruction to Envoy
+
+**Important**: The same non-sequential agent ordering applies to response phase (e.g., agent1 → agent2 → agent1).
 
 ### 6.4 Agent Selection Strategy
 
@@ -354,15 +389,21 @@ Optimized Plan (3 calls):
 **Agent Selection Algorithm:**
 ```go
 func (k *Kernel) createExecutionPlan(policies []*Policy) ([]AgentPolicyGroup, error) {
+    // Phase 1: Validate ALL policies are supported (all-or-nothing check)
+    for _, policy := range policies {
+        agents := k.registry.FindAgentsForPolicy(policy.Name, true /* healthyOnly */)
+        if len(agents) == 0 {
+            return nil, fmt.Errorf("no healthy agent found for policy: %s - skipping entire policy chain", policy.Name)
+        }
+    }
+
+    // Phase 2: Create execution plan (grouping optimization)
     plan := []AgentPolicyGroup{}
     var currentGroup *AgentPolicyGroup
 
     for _, policy := range policies {
-        // Find all healthy agents supporting this policy
+        // Find all healthy agents supporting this policy (guaranteed to exist after Phase 1)
         agents := k.registry.FindAgentsForPolicy(policy.Name, true /* healthyOnly */)
-        if len(agents) == 0 {
-            return nil, fmt.Errorf("no healthy agent found for policy: %s", policy.Name)
-        }
 
         // Try to extend current group if same agent can handle this policy
         if currentGroup != nil && currentGroup.Agent.SupportsPolicy(policy.Name) {
@@ -379,6 +420,87 @@ func (k *Kernel) createExecutionPlan(policies []*Policy) ([]AgentPolicyGroup, er
     }
 
     return plan, nil
+}
+```
+
+### 6.5 All-or-Nothing Policy Validation
+
+The kernel enforces a strict **all-or-nothing validation policy** for route policy chains:
+
+**Validation Rules:**
+
+1. **Complete Coverage Required**: ALL policies in a route's policy chain MUST be supported by at least one healthy agent
+2. **No Partial Execution**: If ANY policy cannot be mapped to a healthy agent, the ENTIRE policy chain is skipped
+3. **Fallback to Default**: When validation fails, the kernel falls back to the `default_policy` configuration
+4. **Applies to Both Phases**: This validation applies to both request and response policy chains independently
+5. **Unknown Route Behavior**: If route is not found in configuration, kernel returns `CONTINUE` (does NOT apply default policy)
+
+**Rationale:**
+
+This strict validation ensures:
+- **Predictable behavior**: Routes either execute completely as configured or fall back to default
+- **Security guarantees**: No partial policy enforcement that could leave security gaps
+- **Clear operational state**: No ambiguity about which policies were applied
+
+**Example Scenarios:**
+
+```yaml
+# Scenario 1: All policies supported
+Route: /api/v1/users
+Policy Chain: [apiKeyAuth, rateLimit, jwtValidation]
+Available Agents:
+  - auth-agent: [apiKeyAuth, jwtValidation]
+  - rate-limiter: [rateLimit]
+Result: ✓ Execute full chain across agents
+
+# Scenario 2: One policy unsupported
+Route: /api/v1/admin
+Policy Chain: [jwtValidation, roleCheck, auditLog]
+Available Agents:
+  - auth-agent: [jwtValidation, roleCheck]
+  - (no agent supports auditLog)
+Result: ✗ Skip ENTIRE chain, apply default_policy
+
+# Scenario 3: Agent becomes unhealthy at runtime
+Route: /api/v1/data
+Policy Chain: [auth, transform]
+Available Agents:
+  - auth-agent: [auth] (healthy)
+  - transform-agent: [transform] (unhealthy)
+Result: ✗ Skip ENTIRE chain, apply default_policy
+
+# Scenario 4: Unknown route (not in configuration)
+Request to: /api/v1/unknown
+Route Configuration: (no match found)
+Result: ✓ CONTINUE (allow request through, no policy execution)
+```
+
+**Validation Timing:**
+
+- **Startup**: Routes are validated against discovered agents. Invalid routes are marked and logged.
+- **Runtime**: Before each request, the kernel validates the policy chain against currently healthy agents.
+- **Dynamic Updates**: When route policies are updated, validation occurs immediately.
+
+**Logging:**
+
+When validation fails, the kernel logs a warning with details:
+```json
+{
+  "level": "warning",
+  "message": "Policy chain validation failed - applying default policy",
+  "route": "/api/v1/admin",
+  "unsupported_policies": ["auditLog"],
+  "available_agents": ["auth-agent", "rate-limiter"]
+}
+```
+
+When route is not found, the kernel logs an info message:
+```json
+{
+  "level": "info",
+  "message": "Route not found - allowing request through",
+  "route": "/api/v1/unknown",
+  "action": "CONTINUE"
 }
 ```
 
@@ -541,15 +663,16 @@ sequenceDiagram
 
 | Error Condition | Behavior | Response to Envoy |
 |----------------|----------|-------------------|
-| Agent unavailable | Log error, skip policy chain | CONTINUE or DENY based on `fail_open` config |
-| Agent timeout | Cancel request, log timeout | CONTINUE or DENY based on `fail_open` config |
+| Agent unavailable at startup | Log error, mark policies invalid | N/A (startup validation) |
+| Agent timeout during execution | Cancel request, log timeout | CONTINUE or DENY based on `fail_open` config |
 | Invalid agent response | Log error, treat as policy failure | DENY with 500 Internal Server Error |
 | Policy execution failure | Depends on policy `on_failure` setting | DENY or CONTINUE based on policy config |
-| Unknown route | Apply default policy or allow | CONTINUE |
+| **Unknown route** | **No policy execution**, log info | **CONTINUE** (allow request through) |
 | Configuration reload failure | Continue with previous config, alert | N/A (runtime operation) |
-| **Multi-agent: Partial chain failure** | Execute successful policies, skip failed | Aggregate partial results, log warning |
+| **Unsupported policy in chain** | **Skip ENTIRE policy chain**, apply default policy | Execute default policy or CONTINUE |
+| **Multi-agent: Partial chain failure** | Stop chain, return aggregated results so far | CONTINUE or DENY based on `on_failure` config |
 | **Multi-agent: Agent failure mid-chain** | Stop chain, return aggregated results so far | CONTINUE or DENY based on `on_failure` config |
-| **Multi-agent: No agent for policy** | Skip policy, log error | Continue with remaining policies |
+| **Multi-agent: All agents unhealthy** | Skip entire chain, apply default policy | Execute default policy or CONTINUE |
 
 ### 8.2 Multi-Agent Error Handling
 
