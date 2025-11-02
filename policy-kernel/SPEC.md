@@ -91,10 +91,12 @@ policy_kernel:
           params:
             log_response_body: true
 
-  default_policy:
-    request_policy_chain:
-      - policy: "allowAll"
-    response_policy_chain: []
+  validation_failure_response:
+    status_code: 502  # Bad Gateway (default)
+    body: '{"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}'
+    headers:
+      Content-Type: "application/json"
+      X-Policy-Error: "true"
 
   observability:
     metrics_port: 9090
@@ -130,15 +132,77 @@ On startup and reload (static YAML configuration):
 - If all agents are unavailable: **Log critical error, continue startup** (all routes marked invalid)
 - Rationale: Prefer availability over strict correctness at startup to avoid complete system failure
 
-### 4.3 Dynamic Configuration Validation (Future)
+### 4.3 Validation Failure Response Configuration
+
+The `validation_failure_response` section configures the immediate error response returned when policy validation fails (i.e., when ANY policy in a route's chain is unsupported by available healthy agents).
+
+**Configuration Schema:**
+
+```yaml
+validation_failure_response:
+  status_code: 502           # HTTP status code (default: 502 Bad Gateway)
+  body: "..."                # Response body (string or JSON)
+  headers:                   # Optional response headers
+    header-name: "value"
+```
+
+**Default Values:**
+
+If not specified in configuration, the kernel uses these defaults:
+- **status_code**: `502` (Bad Gateway)
+- **body**: `'{"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}'`
+- **headers**:
+  - `Content-Type: "application/json"`
+  - `X-Policy-Error: "true"`
+
+**Rationale for 502 Bad Gateway:**
+
+The 502 Bad Gateway status code is appropriate because:
+- Indicates the kernel (acting as a gateway) received an invalid response from upstream agents
+- Signals to clients that the issue is with backend services (agents), not the request itself
+- Encourages retry behavior since it's a temporary service unavailability
+- Distinguishes from 503 Service Unavailable (which typically indicates complete service outage)
+
+**Configuration Examples:**
+
+```yaml
+# Example 1: JSON error response (default)
+validation_failure_response:
+  status_code: 502
+  body: '{"error": "Policy enforcement unavailable", "code": "POLICY_UNAVAILABLE"}'
+  headers:
+    Content-Type: "application/json"
+
+# Example 2: Plain text response
+validation_failure_response:
+  status_code: 503
+  body: "Service temporarily unavailable. Please try again later."
+  headers:
+    Content-Type: "text/plain"
+
+# Example 3: HTML error page
+validation_failure_response:
+  status_code: 502
+  body: |
+    <!DOCTYPE html>
+    <html>
+    <head><title>Service Unavailable</title></head>
+    <body><h1>Service Temporarily Unavailable</h1></body>
+    </html>
+  headers:
+    Content-Type: "text/html"
+```
+
+### 4.4 Dynamic Configuration Validation (Future)
 
 When route policies are loaded dynamically via management API:
 
 **Dynamic Validation Behavior (Strict):**
 - Validate new/updated route policy against currently discovered agents
-- If any policy in the chain is unsupported: **Log errors, mark routes invalid, continue startup**
-- If referenced agent is unavailable or unhealthy: **Log errors, mark routes invalid, continue startup**
-- If parameter schema validation fails: **Log errors, mark routes invalid, continue startup**
+- If any policy in the chain is unsupported: **Reject update, return error**
+- If referenced agent is unavailable or unhealthy: **Reject update, return error**
+- If parameter schema validation fails: **Reject update, return error**
+- Rationale: Dynamic updates should fail fast to prevent invalid configurations from being deployed
 
 ## 5. Agent Discovery and Registry
 
@@ -262,20 +326,14 @@ stateDiagram-v2
     MapPoliciesToAgents --> ValidateMapping: Find agents for each policy
 
     ValidateMapping --> FullCoverage: All policies covered
-    ValidateMapping --> PartialCoverage: ANY policy unsupported
-    ValidateMapping --> NoCoverage: No agents available
+    ValidateMapping --> ValidationFailed: ANY policy unsupported
 
     FullCoverage --> ExecutePolicies: Execute across agents
-    PartialCoverage --> DefaultPolicy: Fallback (all-or-nothing)
-    NoCoverage --> DefaultPolicy: Fallback
-
-    DefaultPolicy --> CheckDefault: Default configured?
-
-    CheckDefault --> ExecutePolicies: Yes
-    CheckDefault --> Continue: No
+    ValidationFailed --> ImmediateResponse: Return configured error
 
     ExecutePolicies --> AggregateResults: Collect from all agents
     AggregateResults --> [*]
+    ImmediateResponse --> [*]
     Continue --> [*]
 
     note right of MapPoliciesToAgents
@@ -292,11 +350,11 @@ stateDiagram-v2
         allow request through
     end note
 
-    note right of PartialCoverage
+    note right of ValidationFailed
         All-or-Nothing validation:
         If ANY policy is unsupported,
-        skip ENTIRE chain and
-        apply default policy
+        return immediate response
+        (502 Bad Gateway by default)
     end note
 
     note right of AggregateResults
@@ -317,9 +375,8 @@ stateDiagram-v2
    - Verify ALL policies can be mapped to available agents
 5. **All-or-Nothing Validation**: Check if all policies in the chain are supported
    - If ALL policies can be mapped to agents: Create execution plan grouping consecutive policies by agent
-   - If ANY policy is unsupported: Skip entire policy chain, apply `default_policy.request_policy_chain` (log warning)
+   - If ANY policy is unsupported: Return `IMMEDIATE_RESPONSE` with configured `validation_failure_response` (log warning)
 6. Execute the validated policy chain across agents in the correct order
-7. If default policy cannot be executed (no agents available), return `CONTINUE` instruction to Envoy
 
 **Important**: The order of agent execution follows the policy chain order. This may result in calling the same agent multiple times in non-sequential order (e.g., agent1 → agent2 → agent1 → agent3).
 
@@ -345,10 +402,9 @@ Execution Plan:
 3. Map each policy in `response_policy_chain` to available agents (same logic as request phase)
 4. **All-or-Nothing Validation**: Check if all policies in the response chain are supported
    - If ALL policies can be mapped to agents: Create execution plan
-   - If ANY policy is unsupported: Skip entire response policy chain, apply `default_policy.response_policy_chain` (log warning)
+   - If ANY policy is unsupported: Return `IMMEDIATE_RESPONSE` with configured `validation_failure_response` (log warning)
 5. Execute the validated response policy chain across agents in the correct order
 6. Aggregate responses from all agents
-7. If default policy cannot be executed (no agents available), return `CONTINUE` instruction to Envoy
 
 **Important**: The same non-sequential agent ordering applies to response phase (e.g., agent1 → agent2 → agent1).
 
@@ -431,16 +487,17 @@ The kernel enforces a strict **all-or-nothing validation policy** for route poli
 
 1. **Complete Coverage Required**: ALL policies in a route's policy chain MUST be supported by at least one healthy agent
 2. **No Partial Execution**: If ANY policy cannot be mapped to a healthy agent, the ENTIRE policy chain is skipped
-3. **Fallback to Default**: When validation fails, the kernel falls back to the `default_policy` configuration
+3. **Immediate Error Response**: When validation fails, the kernel returns an immediate error response (configured via `validation_failure_response`)
 4. **Applies to Both Phases**: This validation applies to both request and response policy chains independently
-5. **Unknown Route Behavior**: If route is not found in configuration, kernel returns `CONTINUE` (does NOT apply default policy)
+5. **Unknown Route Behavior**: If route is not found in configuration, kernel returns `CONTINUE` (not a validation failure)
 
 **Rationale:**
 
 This strict validation ensures:
-- **Predictable behavior**: Routes either execute completely as configured or fall back to default
+- **Predictable behavior**: Routes either execute completely as configured or fail explicitly with an error
 - **Security guarantees**: No partial policy enforcement that could leave security gaps
 - **Clear operational state**: No ambiguity about which policies were applied
+- **Fail-safe defaults**: 502 Bad Gateway clearly indicates a backend service issue
 
 **Example Scenarios:**
 
@@ -459,7 +516,8 @@ Policy Chain: [jwtValidation, roleCheck, auditLog]
 Available Agents:
   - auth-agent: [jwtValidation, roleCheck]
   - (no agent supports auditLog)
-Result: ✗ Skip ENTIRE chain, apply default_policy
+Result: ✗ Skip ENTIRE chain, return IMMEDIATE_RESPONSE (502 Bad Gateway)
+Response: {"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}
 
 # Scenario 3: Agent becomes unhealthy at runtime
 Route: /api/v1/data
@@ -467,7 +525,8 @@ Policy Chain: [auth, transform]
 Available Agents:
   - auth-agent: [auth] (healthy)
   - transform-agent: [transform] (unhealthy)
-Result: ✗ Skip ENTIRE chain, apply default_policy
+Result: ✗ Skip ENTIRE chain, return IMMEDIATE_RESPONSE (502 Bad Gateway)
+Response: {"error": "Service temporarily unavailable", "code": "POLICY_UNAVAILABLE"}
 
 # Scenario 4: Unknown route (not in configuration)
 Request to: /api/v1/unknown
@@ -487,10 +546,12 @@ When validation fails, the kernel logs a warning with details:
 ```json
 {
   "level": "warning",
-  "message": "Policy chain validation failed - applying default policy",
+  "message": "Policy chain validation failed - returning error response",
   "route": "/api/v1/admin",
   "unsupported_policies": ["auditLog"],
-  "available_agents": ["auth-agent", "rate-limiter"]
+  "available_agents": ["auth-agent", "rate-limiter"],
+  "response_status": 502,
+  "action": "IMMEDIATE_RESPONSE"
 }
 ```
 
@@ -669,10 +730,10 @@ sequenceDiagram
 | Policy execution failure | Depends on policy `on_failure` setting | DENY or CONTINUE based on policy config |
 | **Unknown route** | **No policy execution**, log info | **CONTINUE** (allow request through) |
 | Configuration reload failure | Continue with previous config, alert | N/A (runtime operation) |
-| **Unsupported policy in chain** | **Skip ENTIRE policy chain**, apply default policy | Execute default policy or CONTINUE |
+| **Unsupported policy in chain** | **Skip ENTIRE policy chain**, log warning | **IMMEDIATE_RESPONSE** (502 Bad Gateway by default) |
 | **Multi-agent: Partial chain failure** | Stop chain, return aggregated results so far | CONTINUE or DENY based on `on_failure` config |
 | **Multi-agent: Agent failure mid-chain** | Stop chain, return aggregated results so far | CONTINUE or DENY based on `on_failure` config |
-| **Multi-agent: All agents unhealthy** | Skip entire chain, apply default policy | Execute default policy or CONTINUE |
+| **Multi-agent: All agents unhealthy** | **Skip entire chain**, log warning | **IMMEDIATE_RESPONSE** (502 Bad Gateway by default) |
 
 ### 8.2 Multi-Agent Error Handling
 
@@ -1242,5 +1303,6 @@ go build -o policy-kernel ./cmd/kernel
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 1.2 | 2025-11-02 | System | Replaced default_policy with validation_failure_response configuration (immediate error response) |
 | 1.1 | 2025-11-02 | System | Added multi-agent policy execution support with response aggregation |
 | 1.0 | 2025-11-02 | System | Extracted from v2.0 monolithic specification |
