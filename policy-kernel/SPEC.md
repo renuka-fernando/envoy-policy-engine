@@ -391,14 +391,14 @@ stateDiagram-v2
     LookupRoute --> RouteFound: Match found
     LookupRoute --> Continue: No match
 
-    RouteFound --> MapPoliciesToAgents: Partition policy chain
-    MapPoliciesToAgents --> ValidateMapping: Find agents for each policy
+    RouteFound --> MapPoliciesToAgents: Partition policy chains (both phases)
+    MapPoliciesToAgents --> ValidateMapping: Validate BOTH request and response chains
 
-    ValidateMapping --> FullCoverage: All policies have supporting agents
+    ValidateMapping --> FullCoverage: All policies in both phases valid
     ValidateMapping --> PolicyNotSupported: Policy not supported by ANY agent
     ValidateMapping --> AgentUnhealthy: Policy supported but all agents unhealthy
 
-    FullCoverage --> ExecutePolicies: Execute across agents
+    FullCoverage --> ExecutePolicies: Execute request phase policies
     PolicyNotSupported --> ErrorResponse500: Return 500 Internal Server Error
     AgentUnhealthy --> ErrorResponse503: Return 503 Service Unavailable
 
@@ -409,11 +409,12 @@ stateDiagram-v2
     Continue --> [*]
 
     note right of MapPoliciesToAgents
-        For each policy:
-        - Check if ANY agent supports it
+        For BOTH request and response phases:
+        - Check if ANY agent supports each policy
         - Check supporting agents' health
         - Group by agent
         - Maintain execution order
+        Fail fast if either phase invalid
     end note
 
     note left of Continue
@@ -448,39 +449,42 @@ stateDiagram-v2
 1. Extract `route_name` from Envoy request headers or metadata
 2. Lookup route in `route_policies` configuration
 3. **Route Not Found**: If route not found, return `CONTINUE` instruction to Envoy (no policy execution)
-4. **All-or-Nothing Validation**: For each policy in `request_policy_chain`, perform two-stage validation:
+4. **All-or-Nothing Validation (Both Phases)**: Validate **BOTH** request and response phase policy chains upfront to fail fast. For each policy in **both** `request_policy_chain` and `response_policy_chain`, perform two-stage validation:
 
    **Stage 1: Check if policy is supported by ANY agent**
    - Query agent registry to find if ANY agent (healthy or unhealthy) declares support for this policy
    - If NO agent supports the policy → **Configuration Error**
      - Return `IMMEDIATE_RESPONSE` with `policy_not_supported_response` (500 Internal Server Error)
-     - Log error with unsupported policy names
+     - Log error with unsupported policy names and which phase failed
 
    **Stage 2: Check if supporting agents are healthy**
    - Filter supporting agents by health status (only healthy agents)
    - If policy is supported but ALL supporting agents are unhealthy → **Temporary Unavailability**
      - Return `IMMEDIATE_RESPONSE` with `agent_unavailable_response` (503 Service Unavailable)
-     - Log warning with unhealthy agent names
+     - Log warning with unhealthy agent names and which phase failed
 
-   **Success: All policies have healthy supporting agents**
-   - Create execution plan grouping consecutive policies by agent
+   **Success: All policies in BOTH phases have healthy supporting agents**
+   - Create execution plan for request phase policies, grouping consecutive policies by agent
+   - Cache validation results for response phase (to avoid re-validation)
 
-5. Execute the validated policy chain across agents in the correct order
+5. Execute the validated **request phase** policy chain across agents in the correct order
+
+**Rationale for Upfront Validation**: By validating both request and response phase policies during request processing, the system fails fast if either phase would fail. This prevents partial execution where request policies succeed but response policies would fail, providing more predictable behavior and clearer error signaling.
 
 **Important**: The order of agent execution follows the policy chain order. This may result in calling the same agent multiple times in non-sequential order (e.g., agent1 → agent2 → agent1 → agent3).
 
 **Policy-to-Agent Mapping Example:**
 ```
 Route: /api/v1/users
-Policy Chain: [apiKeyAuth, rateLimit, jwtValidation]
+Policy Chain: [apiKeyAuth, rateLimit, tokenBasedRateLimit, jwtValidation]
 
 Agent Registry:
 - auth-agent: supports [apiKeyAuth, jwtValidation]
-- rate-limiter-agent: supports [rateLimit]
+- rate-limiter-agent: supports [rateLimit, tokenBasedRateLimit]
 
 Execution Plan:
 1. auth-agent: [apiKeyAuth]
-2. rate-limiter-agent: [rateLimit]
+2. rate-limiter-agent: [rateLimit, tokenBasedRateLimit]
 3. auth-agent: [jwtValidation]
 ```
 
@@ -488,20 +492,19 @@ Execution Plan:
 
 1. Use the same route matched during request phase
 2. **Route Not Found or No Response Chain**: If route not found or no response chain configured, return `CONTINUE` instruction to Envoy
-3. **All-or-Nothing Validation**: Apply same two-stage validation as request phase (see section 6.2):
+3. **Validation Already Complete**: Response phase policies were already validated during request phase processing (see section 6.2). The validation results are cached, so no re-validation is needed.
 
-   **Stage 1**: Check if each policy is supported by ANY agent
-   - If not → Return `IMMEDIATE_RESPONSE` with `policy_not_supported_response` (500)
+   **Note**: If agents have become unhealthy since request phase validation, the kernel has two options:
+   - **Strict Mode**: Re-check agent health and fail if agents are now unhealthy
+   - **Permissive Mode** (recommended): Use the cached validation results and attempt execution (may fail at execution time)
 
-   **Stage 2**: Check if supporting agents are healthy
-   - If policy supported but all agents unhealthy → Return `IMMEDIATE_RESPONSE` with `agent_unavailable_response` (503)
-
-   **Success**: Create execution plan
-
-4. Execute the validated response policy chain across agents in the correct order
-5. Aggregate responses from all agents
+4. Create execution plan for response phase policies, grouping consecutive policies by agent
+5. Execute the validated response policy chain across agents in the correct order
+6. Aggregate responses from all agents
 
 **Important**: The same non-sequential agent ordering applies to response phase (e.g., agent1 → agent2 → agent1).
+
+**Rationale**: Since both phases were validated upfront during request processing, the response phase can proceed directly to execution. This ensures consistent validation state across both phases and prevents inconsistent behavior where request phase succeeds but response phase fails validation.
 
 ### 6.4 Agent Selection Strategy
 
@@ -538,6 +541,9 @@ Optimized Plan (3 calls):
 ```
 
 **Agent Selection Algorithm:**
+
+**Note**: This function is called **twice during request phase processing** - once for request phase policies and once for response phase policies. If either call fails validation (returns error), the entire request is rejected with an appropriate error response.
+
 ```go
 func (k *Kernel) createExecutionPlan(policies []*Policy) ([]AgentPolicyGroup, error) {
     // Stage 1: Check if ALL policies are supported by at least one agent (configuration check)
@@ -616,7 +622,7 @@ The kernel enforces a strict **all-or-nothing validation policy** for route poli
 4. **Differentiated Error Responses**: Validation failures return different HTTP status codes based on failure type:
    - **500 Internal Server Error**: Policy not supported by any agent (configuration error)
    - **503 Service Unavailable**: Policy supported but all agents unhealthy (temporary condition)
-5. **Applies to Both Phases**: This validation applies to both request and response policy chains independently
+5. **Upfront Validation for Both Phases**: This validation applies to **BOTH** request and response policy chains **upfront during request phase processing** (see section 6.2). If validation fails for either phase, an immediate error response is returned before executing any policies. This "fail fast" approach prevents partial execution where request policies succeed but response policies would fail.
 6. **Unknown Route Behavior**: If route is not found in configuration, kernel returns `CONTINUE` (not a validation failure)
 
 **Rationale:**
@@ -625,6 +631,7 @@ This strict validation ensures:
 - **Predictable behavior**: Routes either execute completely as configured or fail explicitly with an appropriate error
 - **Security guarantees**: No partial policy enforcement that could leave security gaps
 - **Clear operational state**: No ambiguity about which policies were applied
+- **Fail fast**: Validation errors are caught early, preventing wasted execution when response phase would fail
 - **Actionable error signals**: Different status codes guide different responses:
   - 500 → Configuration fix required (permanent issue)
   - 503 → Retry or wait for agent recovery (temporary issue)
@@ -688,8 +695,8 @@ Status: Pass-through (no immediate response)
 **Validation Timing:**
 
 - **Startup**: Routes are validated against discovered agents. Invalid routes are marked and logged.
-- **Runtime**: Before each request, the kernel validates the policy chain against currently healthy agents.
-- **Dynamic Updates**: When route policies are updated, validation occurs immediately.
+- **Runtime**: During request phase processing, the kernel validates **BOTH** request and response policy chains upfront against currently healthy agents. If either phase fails validation, an immediate error response is returned. The response phase uses the cached validation results from request phase.
+- **Dynamic Updates**: When route policies are updated, validation occurs immediately for both request and response policy chains.
 
 **Logging:**
 
@@ -699,11 +706,14 @@ When a policy is not supported by any agent (configuration error):
   "level": "error",
   "message": "Policy not supported by any agent - returning 500 error",
   "route": "/api/v1/admin",
+  "phase": "request",
+  "validation_phase": "upfront",
   "unsupported_policies": ["auditLog"],
   "available_agents": ["auth-agent", "rate-limiter"],
   "error_type": "POLICY_NOT_SUPPORTED",
   "response_status": 500,
-  "action": "IMMEDIATE_RESPONSE"
+  "action": "IMMEDIATE_RESPONSE",
+  "note": "Both request and response phases validated upfront; either phase can trigger this error"
 }
 ```
 
@@ -713,12 +723,15 @@ When agents are unhealthy (temporary unavailability):
   "level": "warning",
   "message": "All supporting agents unhealthy - returning 503 error",
   "route": "/api/v1/data",
+  "phase": "response",
+  "validation_phase": "upfront",
   "affected_policies": ["transform"],
   "unhealthy_agents": ["transform-agent"],
   "error_type": "AGENT_UNAVAILABLE",
   "response_status": 503,
   "action": "IMMEDIATE_RESPONSE",
-  "retry_after": 30
+  "retry_after": 30,
+  "note": "Both request and response phases validated upfront; either phase can trigger this error"
 }
 ```
 
@@ -1470,6 +1483,7 @@ go build -o policy-kernel ./cmd/kernel
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 1.4 | 2025-11-03 | System | Updated validation logic to validate BOTH request and response phase policy chains upfront during request phase processing (fail fast approach). Response phase uses cached validation results. This prevents partial execution where request phase succeeds but response phase would fail validation. |
 | 1.3 | 2025-11-02 | System | Split validation failure response into two configurations: policy_not_supported_response (500) and agent_unavailable_response (503) to distinguish configuration errors from temporary unavailability |
 | 1.2 | 2025-11-02 | System | Replaced default_policy with validation_failure_response configuration (immediate error response) |
 | 1.1 | 2025-11-02 | System | Added multi-agent policy execution support with response aggregation |
