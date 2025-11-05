@@ -136,63 +136,6 @@ agent_core:
 | `max_body_size_bytes` | Maximum request/response body size | `1048576` (1MB) |
 | `max_state_size_bytes` | Maximum context state size | `65536` (64KB) |
 
-## 5. Communication Protocol
-
-### 5.1 Agent Configuration Protocol
-
-The kernel queries the agent at startup to discover capabilities:
-
-```protobuf
-// Request from Kernel to Agent (sent at startup)
-message GetAgentConfigRequest {}
-
-// Response from Agent to Kernel
-message GetAgentConfigResponse {
-  string agent_name = 1;
-  string agent_version = 2;
-  repeated PolicyInfo supported_policies = 3;
-  map<string, string> agent_metadata = 4;
-}
-
-message PolicyInfo {
-  string name = 1;
-  string version = 2;
-  string description = 3;
-  string metadata_schema = 4; // JSON schema for validating policy metadata
-  repeated PolicyPhase supported_phases = 5; // REQUEST, RESPONSE, or both
-}
-
-enum PolicyPhase {
-  REQUEST = 0;
-  RESPONSE = 1;
-}
-```
-
-### 5.2 Policy Execution Protocol
-
-```protobuf
-message PolicyRequest {
-  string request_id = 1;
-  repeated Policy policies = 2;
-  RequestContext context = 3;
-  int64 deadline_ms = 4;
-  PolicyPhase phase = 5; // REQUEST or RESPONSE
-}
-
-message Policy {
-  string name = 1;
-  map<string, string> metadata = 2;
-  string on_failure = 3; // "deny" | "continue" | "skip_remaining"
-}
-
-message PolicyResponse {
-  string request_id = 1;
-  repeated Instruction instructions = 2;
-  ResponseStatus status = 3;
-  string message = 4;
-  map<string, string> metadata = 5;
-}
-```
 
 ## 6. Component Specifications
 

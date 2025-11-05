@@ -747,91 +747,536 @@ When route is not found:
 
 ## 7. Request/Response Protocol
 
-### 7.1 Protocol Definitions
+### 7.1 Protocol Overview
 
-**Request to Agent (gRPC):**
+The Policy Kernel and Policy Agent communicate via gRPC. The Agent acts as the server, and the Kernel acts as the client.
+
+**Communication Pattern:**
+- Unlike Envoy's External Processor API (which sends 4 separate messages: request headers, request body, response headers, response body), the Kernel-Agent protocol uses **2 consolidated messages** per HTTP request:
+  1. **Request Phase Message**: Contains request headers and optionally request body
+  2. **Response Phase Message**: Contains request headers, response headers, and optionally response body
+
+**Body Inclusion:**
+- Body is included only when policies require it (e.g., body validation, transformation)
+- Policies that only need headers (e.g., authentication, rate limiting) omit the body to reduce overhead
+- The `body_included` flag indicates whether body data is present
+
+### 7.2 Agent Service Definition
+
 ```protobuf
-message PolicyRequest {
-  string request_id = 1;
-  repeated Policy policies = 2;
-  RequestContext context = 3;
-  int64 deadline_ms = 4;
-  PolicyPhase phase = 5; // REQUEST or RESPONSE
-}
+service PolicyAgent {
+  // Execute policies for the REQUEST phase (before upstream)
+  rpc ExecutePolicyRequest(PolicyRequestPhase) returns (PolicyRequestResponse);
 
-enum PolicyPhase {
-  REQUEST = 0;
-  RESPONSE = 1;
-}
+  // Execute policies for the RESPONSE phase (after upstream)
+  rpc ExecutePolicyResponse(PolicyResponsePhase) returns (PolicyResponseResponse);
 
-message Policy {
-  string name = 1;
-  map<string, string> params = 2;
-  string on_failure = 3; // "deny" | "continue" | "skip_remaining"
-}
+  // Get agent configuration and supported policies (called at startup)
+  rpc GetAgentConfig(GetAgentConfigRequest) returns (GetAgentConfigResponse);
 
-message RequestContext {
-  map<string, string> headers = 1;
-  bytes body = 2;
-  string method = 3;
-  string path = 4;
-  string scheme = 5;
-  string authority = 6;
-  map<string, string> query_params = 7;
-  string client_ip = 8;
-}
-
-message ResponseContext {
-  map<string, string> headers = 1;
-  bytes body = 2;
-  int32 status_code = 3;
+  // Health check
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 }
 ```
 
-**Response from Agent (gRPC):**
+### 7.3 Protocol Definitions
+
+**Request Phase Messages:**
+
 ```protobuf
-message PolicyResponse {
-  string request_id = 1;
-  repeated Instruction instructions = 2;
-  ResponseStatus status = 3;
-  string message = 4;
-  map<string, string> metadata = 5;
+// Request phase execution - contains only request data
+message PolicyRequestPhase {
+  string request_id = 1;                      // Unique request identifier
+  repeated Policy policies = 2;               // List of policies to execute
+  RequestData request_data = 3;               // Request information
+  int64 deadline_ms = 4;                      // Execution deadline
+  map<string, string> policy_metadata = 5;    // Metadata from previous policies
 }
 
-message Instruction {
-  InstructionType type = 1;
-  oneof payload {
-    HeaderInstruction header = 2;
-    BodyInstruction body = 3;
-    ImmediateResponse immediate_response = 4;
-    ContinueRequest continue_request = 5;
+// Response for request phase execution
+message PolicyRequestResponse {
+  string request_id = 1;                        // Matching request ID
+  repeated RequestInstruction instructions = 2; // Request phase instructions
+  string message = 3;                           // Human-readable message
+  map<string, string> policy_metadata = 4;      // Metadata for subsequent policies
+}
+```
+
+**Response Phase Messages:**
+
+```protobuf
+// Response phase execution - contains both request and response data
+message PolicyResponsePhase {
+  string request_id = 1;                      // Unique request identifier
+  repeated Policy policies = 2;               // List of policies to execute
+  RequestData request_data = 3;               // Original request information
+  ResponseData response_data = 4;             // Response from upstream
+  int64 deadline_ms = 5;                      // Execution deadline
+  map<string, string> policy_metadata = 6;    // Metadata from previous policies
+}
+
+// Response for response phase execution
+message PolicyResponseResponse {
+  string request_id = 1;                         // Matching request ID
+  repeated ResponseInstruction instructions = 2; // Response phase instructions
+  string message = 3;                            // Human-readable message
+  map<string, string> policy_metadata = 4;       // Metadata for subsequent policies
+}
+```
+
+**Common Messages:**
+
+```protobuf
+// Policy configuration
+message Policy {
+  string name = 1;                   // Policy name (e.g., "jwtValidation")
+  map<string, string> params = 2;    // Policy-specific parameters
+  string on_failure = 3;             // "deny" | "continue" | "skip_remaining"
+}
+
+// Request data
+message RequestData {
+  HttpHeaders headers = 1;              // Request headers
+  bytes body = 2;                       // Request body (optional)
+  bool body_included = 3;               // Indicates if body is present
+  string method = 4;                    // HTTP method (GET, POST, etc.)
+  string path = 5;                      // URL path
+  string scheme = 6;                    // http or https
+  string authority = 7;                 // Host header
+  QueryParameters query_params = 8;     // Parsed query parameters
+  string client_ip = 9;                 // Client IP address
+}
+
+// Response data
+message ResponseData {
+  HttpHeaders headers = 1;      // Response headers
+  bytes body = 2;               // Response body (optional)
+  bool body_included = 3;       // Indicates if body is present
+  int32 status_code = 4;        // HTTP status code
+}
+
+// HTTP headers
+message HttpHeaders {
+  repeated HeaderValue headers = 1;
+}
+
+message HeaderValue {
+  string key = 1;
+  string value = 2;
+}
+
+// Query parameters
+message QueryParameters {
+  map<string, string> params = 1;
+}
+```
+
+### 7.4 Instruction Types
+
+Agents return instructions to the Kernel, which specify how to modify the request/response or control the processing flow.
+
+Instructions are **phase-specific** to ensure type safety and prevent invalid operations:
+
+**Request Phase Instructions:**
+
+```protobuf
+message RequestInstruction {
+  oneof instruction {
+    // Header operations (on request headers)
+    SetHeader set_header = 1;
+    AppendHeader append_header = 2;
+    RemoveHeader remove_header = 3;
+
+    // Body operations (on request body)
+    SetBody set_body = 4;
+
+    // Request-specific operations (only valid in request phase)
+    SetPath set_path = 5;
+    SetQueryParam set_query_param = 6;
+    RemoveQueryParam remove_query_param = 7;
+    SetMethod set_method = 8;
+
+    // Immediate response (bypass upstream - request phase only)
+    ImmediateResponse immediate_response = 9;
+
+    // Metadata and control flow
+    SetMetadata set_metadata = 10;
+    Continue continue = 11;
+    SkipRemainingPolicies skip_remaining_policies = 12;
   }
 }
+```
 
-enum InstructionType {
-  SET_HEADER = 0;
-  REMOVE_HEADER = 1;
-  SET_BODY = 2;
-  IMMEDIATE_RESPONSE = 3;
-  CONTINUE = 4;
-}
+**Response Phase Instructions:**
 
-message ResponseStatus {
-  StatusCode code = 1;
-  string policy_name = 2; // Policy that generated this response
-}
+```protobuf
+message ResponseInstruction {
+  oneof instruction {
+    // Header operations (on response headers)
+    SetHeader set_header = 1;
+    AppendHeader append_header = 2;
+    RemoveHeader remove_header = 3;
 
-enum StatusCode {
-  OK = 0;
-  POLICY_DENIED = 1;
-  POLICY_ERROR = 2;
-  TIMEOUT = 3;
+    // Body operations (on response body)
+    SetBody set_body = 4;
+
+    // Response-specific operations (only valid in response phase)
+    SetStatusCode set_status_code = 5;
+
+    // Metadata and control flow
+    SetMetadata set_metadata = 6;
+    Continue continue = 7;
+    SkipRemainingPolicies skip_remaining_policies = 8;
+  }
 }
 ```
 
-### 7.2 Request Processing Flow
+#### 7.4.1 Header Instructions
 
-**Single Agent Execution:**
+Modify HTTP headers on requests or responses.
+
+```protobuf
+// Set or replace a header value
+message SetHeader {
+  string name = 1;   // Header name
+  string value = 2;  // Header value
+}
+
+// Append to existing header (for multi-value headers like Set-Cookie)
+message AppendHeader {
+  string name = 1;   // Header name
+  string value = 2;  // Header value to append
+}
+
+// Remove a header entirely
+message RemoveHeader {
+  string name = 1;  // Header name
+}
+```
+
+**Use Cases:**
+- `SetHeader`: Add authentication tokens, set user ID headers, replace content-type
+- `AppendHeader`: Add multiple values to headers like `Set-Cookie`, `Cache-Control`
+- `RemoveHeader`: Remove sensitive headers like `X-Internal-Token`
+
+**Examples:**
+```
+SetHeader { name: "X-User-ID", value: "12345" }
+SetHeader { name: "Authorization", value: "Bearer token123" }
+AppendHeader { name: "Set-Cookie", value: "session=abc; Path=/" }
+RemoveHeader { name: "X-Internal-Secret" }
+```
+
+#### 7.4.2 Body Instructions
+
+Modify request or response body content.
+
+```protobuf
+message SetBody {
+  bytes body = 1;          // New body content
+  string content_type = 2; // Content-Type header value (optional, updates header if provided)
+}
+```
+
+**Use Cases:**
+- Transform request/response payload
+- Inject or modify JSON fields
+- Filter sensitive data from responses
+- Add security wrappers
+
+**Examples:**
+```
+SetBody {
+  body: '{"status":"ok","data":{"user":"john"}}'
+  content_type: "application/json"
+}
+```
+
+#### 7.4.3 Path Instructions
+
+Rewrite the URL path for request routing.
+
+```protobuf
+message SetPath {
+  string path = 1;  // New URL path
+}
+```
+
+**Use Cases:**
+- Rewrite paths based on user permissions
+- Versioning rewrites (e.g., `/api/users` → `/v2/api/users`)
+- A/B testing route selection
+- Multi-tenancy path prefixing
+
+**Examples:**
+```
+SetPath { path: "/v2/api/users" }
+SetPath { path: "/tenant-123/api/resources" }
+```
+
+#### 7.4.4 Query Parameter Instructions
+
+Modify URL query parameters.
+
+```protobuf
+// Set or replace a query parameter
+message SetQueryParam {
+  string name = 1;   // Parameter name
+  string value = 2;  // Parameter value
+}
+
+// Remove a query parameter
+message RemoveQueryParam {
+  string name = 1;  // Parameter name
+}
+```
+
+**Use Cases:**
+- Add tracking parameters
+- Remove sensitive parameters
+- Inject API keys or tokens
+- Override user-provided parameters
+
+**Examples:**
+```
+SetQueryParam { name: "api_key", value: "secret123" }
+SetQueryParam { name: "user_id", value: "12345" }
+RemoveQueryParam { name: "debug" }
+```
+
+#### 7.4.5 HTTP Method Instructions
+
+Override the HTTP method (request phase only).
+
+```protobuf
+message SetMethod {
+  string method = 1;  // New HTTP method (GET, POST, PUT, DELETE, PATCH, etc.)
+}
+```
+
+**Use Cases:**
+- Method override for legacy systems (e.g., POST tunneling)
+- Security policies that restrict methods
+- REST to GraphQL translation
+
+**Examples:**
+```
+SetMethod { method: "POST" }
+SetMethod { method: "GET" }
+```
+
+#### 7.4.6 Status Code Instructions
+
+Modify the HTTP status code from upstream (response phase only).
+
+```protobuf
+message SetStatusCode {
+  int32 status_code = 1;  // HTTP status code (e.g., 200, 404, 500)
+}
+```
+
+**Use Cases:**
+- Override upstream error codes
+- Convert between status codes (e.g., 404 → 403 for security)
+- Custom error handling policies
+- Status code normalization
+
+**Examples:**
+```
+SetStatusCode { status_code: 403 }  // Convert 404 to 403
+SetStatusCode { status_code: 200 }  // Mask upstream errors
+```
+
+#### 7.4.7 Metadata Instructions
+
+Set metadata to pass data between policies in the chain.
+
+```protobuf
+message SetMetadata {
+  string key = 1;    // Metadata key
+  string value = 2;  // Metadata value
+}
+```
+
+**Use Cases:**
+- Share authentication context between policies (e.g., user ID, roles, permissions)
+- Pass rate limit counters or quota information
+- Propagate user attributes across policy chain
+- Store policy execution results for subsequent policies
+
+**Examples:**
+```
+SetMetadata {
+  key: "authenticated_user_id"
+  value: "12345"
+}
+
+SetMetadata {
+  key: "user_tier"
+  value: "premium"
+}
+
+SetMetadata {
+  key: "auth_scope"
+  value: "read:users,write:posts"
+}
+```
+
+#### 7.4.8 Immediate Response Instructions
+
+Immediately return a response to the client, bypassing upstream (request phase only).
+
+```protobuf
+message ImmediateResponse {
+  int32 status_code = 1;             // HTTP status code
+  bytes body = 2;                    // Response body
+  repeated HeaderValue headers = 3;  // Response headers
+  string reason = 4;                 // Reason for response (for logging/metrics)
+}
+```
+
+**Use Cases:**
+- Deny unauthorized requests
+- Return rate limit errors
+- Send validation error responses
+- Implement circuit breaker responses
+- Custom error pages
+
+**Common Reason Values:**
+- `"authentication_failed"` - Invalid credentials or missing authentication
+- `"unauthorized"` - Authentication succeeded but lacks authorization
+- `"forbidden"` - Access forbidden due to permissions
+- `"rate_limited"` - Rate limit exceeded
+- `"invalid_request"` - Malformed or invalid request
+- `"policy_denied"` - Generic policy denial
+- Custom values specific to policy logic
+
+**Examples:**
+```
+// Authentication failure
+ImmediateResponse {
+  status_code: 401
+  body: '{"error":"Invalid API key"}'
+  headers: [{"key":"Content-Type","value":"application/json"}]
+  reason: "authentication_failed"
+}
+
+// Rate limit exceeded
+ImmediateResponse {
+  status_code: 429
+  body: '{"error":"Rate limit exceeded","retry_after":60}'
+  headers: [
+    {"key":"Content-Type","value":"application/json"},
+    {"key":"Retry-After","value":"60"}
+  ]
+  reason: "rate_limited"
+}
+
+// Custom policy denial
+ImmediateResponse {
+  status_code: 403
+  body: '{"error":"User not allowed to access resource in maintenance mode"}'
+  headers: [{"key":"Content-Type","value":"application/json"}]
+  reason: "maintenance_mode_restriction"
+}
+```
+
+#### 7.4.9 Control Flow Instructions
+
+Control the execution flow of the policy chain (available in both phases).
+
+```protobuf
+// Continue processing normally (policy passed)
+message Continue {
+  string reason = 1;  // Optional reason for logging
+}
+
+// Skip remaining policies in current phase
+message SkipRemainingPolicies {
+  string reason = 1;  // Optional reason for logging
+}
+```
+
+**Use Cases:**
+
+**Continue**: Explicit signal that policy passed and processing should continue
+- Default behavior when all policies succeed
+- Used for clarity in policy logic
+
+**SkipRemainingPolicies**: Short-circuit the policy chain
+- Authentication policy detects internal/trusted traffic
+- Early exit when request is whitelisted
+- Skip expensive policies for cached responses
+- Optimization when later policies are unnecessary
+
+**Examples:**
+```
+// Skip rate limiting for internal traffic
+SkipRemainingPolicies {
+  reason: "internal_traffic_whitelisted"
+}
+
+// Explicit continue
+Continue {
+  reason: "jwt_validation_passed"
+}
+```
+
+### 7.5 Instruction Composition
+
+Agents can return multiple instructions in a single response. Instructions are applied in order.
+
+**Phase-Specific Constraints:**
+- **Request phase**: Can use all request instructions including `ImmediateResponse`, `SetPath`, `SetMethod`, `SetQueryParam`
+- **Response phase**: Can use response instructions including `SetStatusCode`, but NOT `ImmediateResponse` or request-modification instructions
+
+**Valid Combinations:**
+- Multiple header instructions (SetHeader, AppendHeader, RemoveHeader)
+- Multiple query parameter instructions (SetQueryParam, RemoveQueryParam) - request phase only
+- Multiple metadata instructions (SetMetadata)
+- Header + body instructions (SetHeader + SetBody)
+- Path + query instructions (SetPath + SetQueryParam) - request phase only
+- Any modification instruction + control flow (Continue/SkipRemainingPolicies)
+
+**Invalid Combinations:**
+- Multiple immediate responses (only first is used) - request phase only
+- Control flow after immediate response (immediate response takes precedence)
+- Multiple Continue or SkipRemainingPolicies instructions (only first is used)
+- Request-specific instructions in response phase (SetPath, SetMethod, SetQueryParam, ImmediateResponse)
+- Response-specific instructions in request phase (SetStatusCode)
+
+**Example Request Phase Multi-Instruction Response:**
+```protobuf
+PolicyRequestResponse {
+  request_id: "req-12345"
+  instructions: [
+    RequestInstruction { set_header: { name: "X-User-ID", value: "12345" } },
+    RequestInstruction { set_header: { name: "X-User-Tier", value: "premium" } },
+    RequestInstruction { set_metadata: { key: "user_tier", value: "premium" } },
+    RequestInstruction { continue: { reason: "jwt_validation_passed" } }
+  ]
+  message: "JWT validation successful"
+  policy_metadata: { "authenticated_user_id": "12345" }
+}
+```
+
+**Example Response Phase Multi-Instruction Response:**
+```protobuf
+PolicyResponseResponse {
+  request_id: "req-12345"
+  instructions: [
+    ResponseInstruction { set_header: { name: "X-Content-Type-Options", value: "nosniff" } },
+    ResponseInstruction { set_header: { name: "X-Frame-Options", value: "DENY" } },
+    ResponseInstruction { set_status_code: { status_code: 200 } },
+    ResponseInstruction { continue: { reason: "security_headers_added" } }
+  ]
+  message: "Security headers applied"
+}
+```
+
+### 7.6 Request Processing Flow
+
+**Request Phase Execution:**
 ```mermaid
 sequenceDiagram
     participant Envoy
@@ -840,16 +1285,16 @@ sequenceDiagram
 
     Envoy->>Kernel: ProcessingRequest<br/>(headers, body, route)
 
-    Note over Kernel: 1. Extract route_name<br/>2. Select policies<br/>3. Map policies to agent
+    Note over Kernel: 1. Extract route_name<br/>2. Select request policies<br/>3. Map policies to agent
 
-    Kernel->>Agent: PolicyRequest<br/>(policies, params, context)
+    Kernel->>Agent: ExecutePolicyRequest<br/>(PolicyRequestPhase)
 
     alt Success
-        Agent-->>Kernel: PolicyResponse<br/>(instructions, OK)
+        Agent-->>Kernel: PolicyRequestResponse<br/>(RequestInstructions)
         Note over Kernel: Convert instructions to Envoy format
         Kernel-->>Envoy: ProcessingResponse<br/>(CONTINUE/MODIFY)
     else Policy Denied
-        Agent-->>Kernel: PolicyResponse<br/>(immediate_response, DENIED)
+        Agent-->>Kernel: PolicyRequestResponse<br/>(ImmediateResponse)
         Kernel-->>Envoy: ProcessingResponse<br/>(IMMEDIATE_RESPONSE 401/403)
     else Agent Timeout
         Note over Kernel: Handle based on fail_open config
@@ -860,7 +1305,33 @@ sequenceDiagram
     end
 ```
 
-**Multi-Agent Execution:**
+**Response Phase Execution:**
+```mermaid
+sequenceDiagram
+    participant Envoy
+    participant Kernel
+    participant Agent
+
+    Envoy->>Kernel: ProcessingResponse<br/>(response headers, body)
+
+    Note over Kernel: 1. Get route from request phase<br/>2. Select response policies<br/>3. Map policies to agent
+
+    Kernel->>Agent: ExecutePolicyResponse<br/>(PolicyResponsePhase)
+
+    alt Success
+        Agent-->>Kernel: PolicyResponseResponse<br/>(ResponseInstructions)
+        Note over Kernel: Convert instructions to Envoy format
+        Kernel-->>Envoy: ProcessingResponse<br/>(CONTINUE/MODIFY)
+    else Agent Timeout
+        Note over Kernel: Handle based on fail_open config
+        Kernel-->>Envoy: ProcessingResponse<br/>(CONTINUE or DENY)
+    else Agent Unavailable
+        Note over Kernel: Handle based on fail_open config
+        Kernel-->>Envoy: ProcessingResponse<br/>(CONTINUE or DENY)
+    end
+```
+
+**Multi-Agent Request Phase Execution:**
 ```mermaid
 sequenceDiagram
     participant Envoy
@@ -871,28 +1342,28 @@ sequenceDiagram
 
     Envoy->>Kernel: ProcessingRequest<br/>(headers, body, route)
 
-    Note over Kernel: 1. Extract route_name<br/>2. Map policies to agents<br/>3. Create execution plan
+    Note over Kernel: 1. Extract route_name<br/>2. Map request policies to agents<br/>3. Create execution plan
 
-    Note over Kernel: Policy Chain:<br/>[auth, rateLimit, validate]<br/>Agent1: [auth]<br/>Agent2: [rateLimit]<br/>Agent3: [validate]
+    Note over Kernel: Request Policy Chain:<br/>[auth, rateLimit, validate]<br/>Agent1: [auth]<br/>Agent2: [rateLimit]<br/>Agent3: [validate]
 
-    Kernel->>Agent1: PolicyRequest<br/>([auth], params, context)
-    Agent1-->>Kernel: PolicyResponse<br/>(instructions, OK)
+    Kernel->>Agent1: ExecutePolicyRequest<br/>(PolicyRequestPhase: [auth])
+    Agent1-->>Kernel: PolicyRequestResponse<br/>(RequestInstructions)
 
     Note over Kernel: Update context with<br/>instructions from Agent1
 
-    Kernel->>Agent2: PolicyRequest<br/>([rateLimit], updated_context)
-    Agent2-->>Kernel: PolicyResponse<br/>(instructions, OK)
+    Kernel->>Agent2: ExecutePolicyRequest<br/>(PolicyRequestPhase: [rateLimit])
+    Agent2-->>Kernel: PolicyRequestResponse<br/>(RequestInstructions)
 
     Note over Kernel: Update context with<br/>instructions from Agent2
 
-    Kernel->>Agent3: PolicyRequest<br/>([validate], updated_context)
+    Kernel->>Agent3: ExecutePolicyRequest<br/>(PolicyRequestPhase: [validate])
 
     alt Success
-        Agent3-->>Kernel: PolicyResponse<br/>(instructions, OK)
+        Agent3-->>Kernel: PolicyRequestResponse<br/>(RequestInstructions)
         Note over Kernel: Aggregate all instructions<br/>from Agent1, Agent2, Agent3
         Kernel-->>Envoy: ProcessingResponse<br/>(CONTINUE with mutations)
     else Policy Denied (any agent)
-        Agent3-->>Kernel: PolicyResponse<br/>(immediate_response, DENIED)
+        Agent3-->>Kernel: PolicyRequestResponse<br/>(ImmediateResponse)
         Note over Kernel: Short-circuit:<br/>Stop execution, return denial
         Kernel-->>Envoy: ProcessingResponse<br/>(IMMEDIATE_RESPONSE 401/403)
     end
@@ -1483,6 +1954,7 @@ go build -o policy-kernel ./cmd/kernel
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 1.5 | 2025-11-05 | System | Redesigned Kernel-Agent protocol: consolidated to 2 messages (request/response phase) vs 4 in Envoy External Processor; added comprehensive instruction set with clear action-based naming: SetHeader, AppendHeader, RemoveHeader, SetBody, SetPath, SetQueryParam, RemoveQueryParam, SetMethod, SetMetadata (simplified key-value pairs for policy-to-policy data passing), ImmediateResponse with DenyReason enum, Continue, and SkipRemainingPolicies; added body_included flag for selective body transmission |
 | 1.4 | 2025-11-03 | System | Updated validation logic to validate BOTH request and response phase policy chains upfront during request phase processing (fail fast approach). Response phase uses cached validation results. This prevents partial execution where request phase succeeds but response phase would fail validation. |
 | 1.3 | 2025-11-02 | System | Split validation failure response into two configurations: policy_not_supported_response (500) and agent_unavailable_response (503) to distinguish configuration errors from temporary unavailability |
 | 1.2 | 2025-11-02 | System | Replaced default_policy with validation_failure_response configuration (immediate error response) |
