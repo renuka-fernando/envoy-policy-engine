@@ -1,23 +1,23 @@
-# Policy Agent Specification
+# Policy Worker Specification
 
 ## 1. Overview
 
-The Policy Agent is a single binary (`policy-agent`) that contains:
-- **Agent Core**: The gRPC server and execution engine
+The Policy Worker is a single binary (`policy-worker`) that contains:
+- **Worker Core**: The gRPC server and execution engine
 - **Policy Implementations**: Compiled-in policy modules (apiKeyAuth, jwtValidation, rateLimit, etc.)
 
-The agent receives policy execution requests from the Policy Kernel, executes policies sequentially, maintains request context, and returns aggregated instructions.
+The worker receives policy execution requests from the Policy Kernel, executes policies sequentially, maintains request context, and returns aggregated instructions.
 
 ## 2. Binary Architecture
 
 ```mermaid
 graph TB
-    subgraph Binary["policy-agent binary"]
+    subgraph Binary["policy-worker binary"]
         direction TB
 
         Main[main.go]
 
-        subgraph Core["Agent Core"]
+        subgraph Core["Worker Core"]
             Server[gRPC Server]
             Registry[Policy Registry]
             Executor[Sequential Executor]
@@ -52,28 +52,28 @@ graph TB
 
 ### 3.1 Single Binary Compilation
 
-**All policy implementations are compiled directly into the `policy-agent` binary:**
+**All policy implementations are compiled directly into the `policy-worker` binary:**
 - Policies are not loaded dynamically or via plugins
 - Each policy is a Go package/module imported at compile time
-- The agent core imports all policy packages and registers them in the policy registry at startup
+- The worker core imports all policy packages and registers them in the policy registry at startup
 
 ### 3.2 Policy Registration
 
-On startup, the agent binary:
+On startup, the worker binary:
 
 ```go
-// Example: Agent initialization
+// Example: Worker initialization
 func main() {
     config := loadConfig()
-    agent := NewAgent(config)
+    worker := NewWorker(config)
 
     // Register all compiled-in policies
-    agent.RegisterPolicy(apikey.NewAPIKeyPolicy())
-    agent.RegisterPolicy(jwt.NewJWTPolicy())
-    agent.RegisterPolicy(ratelimit.NewRateLimitPolicy())
+    worker.RegisterPolicy(apikey.NewAPIKeyPolicy())
+    worker.RegisterPolicy(jwt.NewJWTPolicy())
+    worker.RegisterPolicy(ratelimit.NewRateLimitPolicy())
     // ... other policies
 
-    agent.Start()
+    worker.Start()
 }
 ```
 
@@ -104,9 +104,9 @@ func main() {
 ### 4.1 Configuration Schema
 
 ```yaml
-agent_core:
-  name: "default-agent"
-  socket_path: "/var/run/policy-engine/agents/default.sock"
+worker_core:
+  name: "default-worker"
+  socket_path: "/var/run/policy-engine/workers/default.sock"
 
   server:
     max_concurrent_requests: 1000
@@ -128,8 +128,8 @@ agent_core:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `name` | Agent name for identification | `default-agent` |
-| `socket_path` | UDS path for communication with kernel | `/var/run/policy-engine/agents/default.sock` |
+| `name` | Worker name for identification | `default-worker` |
+| `socket_path` | UDS path for communication with kernel | `/var/run/policy-engine/workers/default.sock` |
 | `max_concurrent_requests` | Maximum concurrent policy executions | `1000` |
 | `request_timeout_ms` | Hard timeout for policy execution | `5000` |
 | `fail_on_unknown` | Fail if unknown policy requested | `false` |
@@ -139,9 +139,9 @@ agent_core:
 
 ## 6. Component Specifications
 
-The Policy Agent consists of two main parts:
+The Policy Worker consists of two main parts:
 
-- **[Agent Core](agent-core/SPEC.md)** - Execution engine, policy registry, context management
+- **[Worker Core](worker-core/SPEC.md)** - Execution engine, policy registry, context management
 - **[Policies](policies/SPEC.md)** - Policy implementations and development guide
 
 ## 7. Observability
@@ -152,7 +152,7 @@ The Policy Agent consists of two main parts:
 var (
     executionsTotal = prometheus.NewCounterVec(
         prometheus.CounterOpts{
-            Name: "policy_agent_executions_total",
+            Name: "policy_worker_executions_total",
             Help: "Total number of policy executions",
         },
         []string{"policy", "status"},
@@ -160,7 +160,7 @@ var (
 
     executionDuration = prometheus.NewHistogramVec(
         prometheus.HistogramOpts{
-            Name: "policy_agent_execution_duration_seconds",
+            Name: "policy_worker_execution_duration_seconds",
             Help: "Policy execution duration",
             Buckets: []float64{.001, .005, .010, .025, .050, .100, .250, .500},
         },
@@ -169,7 +169,7 @@ var (
 
     policyFailures = prometheus.NewCounterVec(
         prometheus.CounterOpts{
-            Name: "policy_agent_policy_failures_total",
+            Name: "policy_worker_policy_failures_total",
             Help: "Total number of policy failures",
         },
         []string{"policy", "reason"},
@@ -177,7 +177,7 @@ var (
 
     contextSize = prometheus.NewHistogramVec(
         prometheus.HistogramOpts{
-            Name: "policy_agent_context_size_bytes",
+            Name: "policy_worker_context_size_bytes",
             Help: "Size of request context",
             Buckets: []float64{100, 500, 1000, 5000, 10000, 50000, 100000},
         },
@@ -193,7 +193,7 @@ var (
 {
   "timestamp": "2025-11-02T10:15:30Z",
   "level": "info",
-  "component": "agent",
+  "component": "worker",
   "request_id": "req-12345",
   "policy": "apiKeyAuth",
   "message": "Policy executed successfully",
@@ -208,55 +208,55 @@ var (
 ### 7.3 Tracing
 
 OpenTelemetry spans:
-- `agent.process_request` (root span)
-  - `agent.policy.{policy_name}` (per policy)
-  - `agent.context_update`
+- `worker.process_request` (root span)
+  - `worker.policy.{policy_name}` (per policy)
+  - `worker.context_update`
 
 ## 8. Deployment
 
 ### 8.1 Container Configuration
 
-**Supervisord configuration for agent:**
+**Supervisord configuration for worker:**
 ```ini
-[program:policy-agent]
-command=/usr/local/bin/policy-agent --config=/etc/policy-engine/agent-config.yaml
+[program:policy-worker]
+command=/usr/local/bin/policy-worker --config=/etc/policy-engine/worker-config.yaml
 autostart=true
 autorestart=true
 startretries=3
-stdout_logfile=/var/log/policy-engine/agent.log
-stderr_logfile=/var/log/policy-engine/agent-error.log
+stdout_logfile=/var/log/policy-engine/worker.log
+stderr_logfile=/var/log/policy-engine/worker-error.log
 priority=2
 ```
 
 ### 8.2 Build Process
 
 ```bash
-# Build Policy Agent (includes all policy implementations)
-cd policy-agent
+# Build Policy Worker (includes all policy implementations)
+cd policy-worker
 
 # All policies are imported in main.go or a registration file
 # Example structure:
-# policy-agent/
-#   cmd/agent/main.go          # Entry point, registers all policies
-#   internal/core/             # Agent core implementation
+# policy-worker/
+#   cmd/worker/main.go          # Entry point, registers all policies
+#   internal/core/             # Worker core implementation
 #   internal/policies/
 #     apikey/apikey.go
 #     jwt/jwt.go
 #     ratelimit/ratelimit.go
 #     custom1/custom1.go
 
-go build -o policy-agent ./cmd/agent
+go build -o policy-worker ./cmd/worker
 ```
 
 ### 8.3 Binary Structure
 
 ```
-policy-agent/
+policy-worker/
 ├── cmd/
-│   └── agent/
+│   └── worker/
 │       └── main.go                  # Entry point, policy registration
 ├── internal/
-│   ├── core/                        # Agent core implementation
+│   ├── core/                        # Worker core implementation
 │   │   ├── server.go               # gRPC server
 │   │   ├── registry.go             # Policy registry
 │   │   ├── executor.go             # Sequential executor

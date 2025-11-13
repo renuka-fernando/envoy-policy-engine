@@ -1,8 +1,8 @@
-# Agent Core Specification
+# Worker Core Specification
 
 ## 1. Overview
 
-The Agent Core is the execution engine within the Policy Agent. It provides the gRPC server, policy registry, sequential execution engine, and request context management.
+The Worker Core is the execution engine within the Policy Worker. It provides the gRPC server, policy registry, sequential execution engine, and request context management.
 
 ## 2. Responsibilities
 
@@ -17,7 +17,7 @@ The Agent Core is the execution engine within the Policy Agent. It provides the 
 
 ```mermaid
 graph TB
-    subgraph Core["Agent Core"]
+    subgraph Core["Worker Core"]
         Server[gRPC Server<br/>UDS Listener]
         Registry["Policy Registry<br/>map[string]Policy"]
         Executor[Sequential Executor]
@@ -47,7 +47,7 @@ graph TB
 
 ```go
 // Policy represents a single policy implementation that can be executed
-// by a Policy Agent. Each Policy is responsible for:
+// by a Policy Worker. Each Policy is responsible for:
 // - Declaring its metadata (name, version, supported phases, parameters)
 // - Executing policy logic for request and/or response phases
 type Policy interface {
@@ -780,13 +780,13 @@ func (r *PolicyRegistry) List() []PolicyInfo {
 ### 7.2 Policy Registration at Startup
 
 ```go
-// In cmd/agent/main.go
+// In cmd/worker/main.go
 func main() {
     // Load configuration
     config := loadConfig()
 
-    // Create agent core
-    core := agentcore.New(config)
+    // Create worker core
+    core := workercore.New(config)
 
     // Register all compiled-in policies
     core.RegisterPolicy(apikey.NewAPIKeyPolicy())
@@ -842,28 +842,28 @@ func (a *InstructionAccumulator) Build(requestID string, status StatusCode, mess
 ### 9.1 Service Implementation
 
 ```go
-type AgentServer struct {
+type WorkerServer struct {
     executor  *Executor
     registry  *PolicyRegistry
     config    *Config
     logger    *Logger
 }
 
-func (s *AgentServer) GetAgentConfig(ctx context.Context, req *GetAgentConfigRequest) (*GetAgentConfigResponse, error) {
+func (s *WorkerServer) GetWorkerConfig(ctx context.Context, req *GetWorkerConfigRequest) (*GetWorkerConfigResponse, error) {
     policies := s.registry.List()
 
-    return &GetAgentConfigResponse{
-        AgentName:         s.config.Name,
-        AgentVersion:      s.config.Version,
+    return &GetWorkerConfigResponse{
+        WorkerName:         s.config.Name,
+        WorkerVersion:      s.config.Version,
         SupportedPolicies: policies,
-        AgentMetadata: map[string]string{
+        WorkerMetadata: map[string]string{
             "max_body_size":  fmt.Sprintf("%d", s.config.MaxBodySize),
             "max_state_size": fmt.Sprintf("%d", s.config.MaxStateSize),
         },
     }, nil
 }
 
-func (s *AgentServer) ExecutePolicies(ctx context.Context, req *PolicyRequest) (*PolicyResponse, error) {
+func (s *WorkerServer) ExecutePolicies(ctx context.Context, req *PolicyRequest) (*PolicyResponse, error) {
     // Validate request
     if err := s.validateRequest(req); err != nil {
         return nil, status.Errorf(codes.InvalidArgument, "invalid request: %v", err)
@@ -879,7 +879,7 @@ func (s *AgentServer) ExecutePolicies(ctx context.Context, req *PolicyRequest) (
     return resp, nil
 }
 
-func (s *AgentServer) HealthCheck(ctx context.Context, req *HealthCheckRequest) (*HealthCheckResponse, error) {
+func (s *WorkerServer) HealthCheck(ctx context.Context, req *HealthCheckRequest) (*HealthCheckResponse, error) {
     // Check all registered policies
     for _, policy := range s.registry.List() {
         impl, _ := s.registry.Get(policy.Name)
@@ -901,7 +901,7 @@ func (s *AgentServer) HealthCheck(ctx context.Context, req *HealthCheckRequest) 
 ### 9.2 Server Startup
 
 ```go
-func (s *AgentServer) Start() error {
+func (s *WorkerServer) Start() error {
     // Remove existing socket file if exists
     if err := os.Remove(s.config.SocketPath); err != nil && !os.IsNotExist(err) {
         return fmt.Errorf("failed to remove socket: %w", err)
@@ -924,10 +924,10 @@ func (s *AgentServer) Start() error {
     )
 
     // Register service
-    pb.RegisterPolicyAgentServer(grpcServer, s)
+    pb.RegisterPolicyWorkerServer(grpcServer, s)
 
     // Start serving
-    s.logger.Info("Agent server starting", "socket", s.config.SocketPath)
+    s.logger.Info("Worker server starting", "socket", s.config.SocketPath)
     return grpcServer.Serve(listener)
 }
 ```

@@ -11,10 +11,10 @@ envoy-policy-engine/
 ├── SPEC.md                          # Root specification (overview, architecture, deployment)
 ├── policy-kernel/
 │   └── SPEC.md                      # Policy Kernel specification
-└── policy-agent/
-    ├── SPEC.md                      # Policy Agent specification
-    ├── agent-core/
-    │   └── SPEC.md                  # Agent Core specification
+└── policy-worker/
+    ├── SPEC.md                      # Policy Worker specification
+    ├── worker-core/
+    │   └── SPEC.md                  # Worker Core specification
     └── policies/
         └── SPEC.md                  # Policies specification and development guide
 ```
@@ -31,24 +31,24 @@ envoy-policy-engine/
 ### [Policy Kernel](policy-kernel/SPEC.md)
 - Envoy External Processing API implementation
 - Route-based policy selection
-- Agent registry and discovery
+- Worker registry and discovery
 - Request orchestration and response aggregation
 - Configuration schema and hot reload
 
-### [Policy Agent](policy-agent/SPEC.md)
+### [Policy Worker](policy-worker/SPEC.md)
 - Binary architecture (compiled-in policies)
 - Communication protocols
 - Configuration schema
 - Deployment and build process
 
-#### [Agent Core](policy-agent/agent-core/SPEC.md)
+#### [Worker Core](policy-worker/worker-core/SPEC.md)
 - gRPC server implementation
 - Policy registry
 - Sequential execution engine
 - Context management
 - Instruction accumulation
 
-#### [Policies](policy-agent/policies/SPEC.md)
+#### [Policies](policy-worker/policies/SPEC.md)
 - Policy interface definition
 - Development guidelines and best practices
 - Example implementations (API Key, JWT, Rate Limit)
@@ -61,9 +61,9 @@ envoy-policy-engine/
 
 1. Start with [SPEC.md](SPEC.md) for system overview and architecture
 2. Read [policy-kernel/SPEC.md](policy-kernel/SPEC.md) to understand Envoy integration
-3. Read [policy-agent/SPEC.md](policy-agent/SPEC.md) for agent architecture
-4. Dive into [agent-core/SPEC.md](policy-agent/agent-core/SPEC.md) for execution engine details
-5. See [policies/SPEC.md](policy-agent/policies/SPEC.md) for policy development
+3. Read [policy-worker/SPEC.md](policy-worker/SPEC.md) for worker architecture
+4. Dive into [worker-core/SPEC.md](policy-worker/worker-core/SPEC.md) for execution engine details
+5. See [policies/SPEC.md](policy-worker/policies/SPEC.md) for policy development
 
 ### Architecture Diagram
 
@@ -71,26 +71,29 @@ envoy-policy-engine/
 graph TB
     Envoy[Envoy Proxy] -->|gRPC :9001| Kernel[Policy Kernel]
 
-    subgraph Container["Docker Container: policy-engine"]
-        Kernel -->|gRPC/UDS| Agent[Policy Agent]
+    subgraph PolicyEngine["Policy Engine"]
+        Kernel -->|gRPC/UDS| Worker1[Policy Worker 1]
+        Kernel -->|gRPC/UDS| Worker2[Policy Worker 2]
 
-        subgraph Agent
-            Core[Agent Core] --> Policies[Policies]
+        subgraph Worker1
+            Core1[Worker Core] --> Policies1[Policies]
+        end
+
+        subgraph Worker2
+            Core[Worker Core] --> Policies2[Policies]
         end
     end
-
-    style Container fill:#f5f5f5,stroke:#333,stroke-width:3px
 ```
 
 ## Key Concepts
 
 - **Policy Kernel**: Orchestrator that interfaces with Envoy
-- **Policy Agent**: Execution runtime with compiled-in policies
-- **Agent Core**: Execution engine and policy registry
+- **Policy Worker**: Execution runtime with compiled-in policies
+- **Worker Core**: Execution engine and policy registry
 - **Policy**: Individual enforcement module (auth, rate limiting, etc.)
 - **Route-Based Selection**: Different policy chains for different routes
 - **Sequential Execution**: Policies execute in order with context updates
-- **UDS Communication**: Unix Domain Sockets for kernel-agent communication
+- **UDS Communication**: Unix Domain Sockets for kernel-worker communication
 
 ## Related Files
 

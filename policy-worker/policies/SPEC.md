@@ -2,13 +2,13 @@
 
 ## 1. Overview
 
-This document describes policy implementations, the policy interface, development guidelines, and example implementations. All policies are compiled into the `policy-agent` binary and registered at startup.
+This document describes policy implementations, the policy interface, development guidelines, and example implementations. All policies are compiled into the `policy-worker` binary and registered at startup.
 
 ## 2. Policy Interface
 
 ### 2.1 Required Interface
 
-Every policy must implement the `Policy` interface defined in the Agent Core:
+Every policy must implement the `Policy` interface defined in the Worker Core:
 
 ```go
 package policies
@@ -700,31 +700,31 @@ func (p *RateLimitPolicy) getLimiter(identifier string, rps float64, burst int) 
 ### 8.1 Main Registration File
 
 ```go
-// cmd/agent/main.go
+// cmd/worker/main.go
 package main
 
 import (
-    "github.com/policy-engine/policy-agent/internal/core"
-    "github.com/policy-engine/policy-agent/internal/policies/apikey"
-    "github.com/policy-engine/policy-agent/internal/policies/jwt"
-    "github.com/policy-engine/policy-agent/internal/policies/ratelimit"
+    "github.com/policy-engine/policy-worker/internal/core"
+    "github.com/policy-engine/policy-worker/internal/policies/apikey"
+    "github.com/policy-engine/policy-worker/internal/policies/jwt"
+    "github.com/policy-engine/policy-worker/internal/policies/ratelimit"
 )
 
 func main() {
     config := loadConfig()
-    agent := core.NewAgent(config)
+    worker := core.NewWorker(config)
 
     // Register all policies
-    registerPolicies(agent)
+    registerPolicies(worker)
 
-    // Start agent
-    agent.Start()
+    // Start worker
+    worker.Start()
 }
 
-func registerPolicies(agent *core.Agent) {
-    agent.RegisterPolicy(apikey.NewAPIKeyPolicy())
-    agent.RegisterPolicy(jwt.NewJWTPolicy())
-    agent.RegisterPolicy(ratelimit.NewRateLimitPolicy())
+func registerPolicies(worker *core.Worker) {
+    worker.RegisterPolicy(apikey.NewAPIKeyPolicy())
+    worker.RegisterPolicy(jwt.NewJWTPolicy())
+    worker.RegisterPolicy(ratelimit.NewRateLimitPolicy())
     // Add more policies here
 }
 ```
