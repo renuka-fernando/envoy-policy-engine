@@ -61,35 +61,43 @@ policy_kernel:
 
   route_policies:
     - route_name: "/api/v1/users"
-      request_policy_chain:
-        - policy: "apiKeyAuth"
-          params:
-            header_name: "X-API-Key"
-            required: true
-        - policy: "rateLimit"
-          params:
-            requests_per_second: 100
-            burst: 20
-      response_policy_chain:
-        - policy: "addSecurityHeaders"
-          params:
-            headers: |
-              X-Content-Type-Options: "nosniff"
-              X-Frame-Options: "DENY"
+      request_flow:
+        processing_mode: "headers_only"  # Options: headers_only, buffered_body, streaming, auto
+        policy_chain:
+          - policy: "apiKeyAuth"
+            params:
+              header_name: "X-API-Key"
+              required: true
+          - policy: "rateLimit"
+            params:
+              requests_per_second: 100
+              burst: 20
+      response_flow:
+        processing_mode: "headers_only"  # Options: headers_only, buffered_body, streaming, auto
+        policy_chain:
+          - policy: "addSecurityHeaders"
+            params:
+              headers: |
+                X-Content-Type-Options: "nosniff"
+                X-Frame-Options: "DENY"
 
     - route_name: "/api/v1/admin"
-      request_policy_chain:
-        - policy: "jwtValidation"
-          params:
-            issuer: "https://auth.example.com"
-            audience: "api-service"
-        - policy: "roleCheck"
-          params:
-            required_roles: ["admin"]
-      response_policy_chain:
-        - policy: "auditLog"
-          params:
-            log_response_body: true
+      request_flow:
+        processing_mode: "buffered_body"  # Options: headers_only, buffered_body, streaming, auto
+        policy_chain:
+          - policy: "jwtValidation"
+            params:
+              issuer: "https://auth.example.com"
+              audience: "api-service"
+          - policy: "roleCheck"
+            params:
+              required_roles: ["admin"]
+      response_flow:
+        processing_mode: "buffered_body"  # Options: headers_only, buffered_body, streaming, auto
+        policy_chain:
+          - policy: "auditLog"
+            params:
+              log_response_body: true
 
   policy_not_supported_response:
     status_code: 500  # Internal Server Error (default)
@@ -125,7 +133,186 @@ policy_kernel:
 > - Version management and rollback capabilities
 > - Validation of dynamic policy updates against available workers
 
-### 4.2 Startup Configuration Validation
+### 4.2 Request Processing Modes
+
+The `processing_mode` field in `request_flow` controls how the Policy Kernel processes requests and executes policies in the request phase. This determines which Envoy External Processing messages are used to execute the policy chain.
+
+**Processing Mode Options:**
+
+1. **`headers_only`** - Execute all policies using request headers only
+   - All policies in the chain are executed once during Envoy's `ProcessingRequest_RequestHeaders` phase
+   - Request body is NOT sent to workers
+   - Use for policies that only need header information (authentication, rate limiting, routing decisions)
+   - Lowest latency option as body buffering is avoided
+   - Policies execute: **Header processing function only**
+
+2. **`buffered_body`** - Execute all policies with buffered request body
+   - All policies in the chain are executed once during Envoy's `ProcessingRequest_RequestBody` phase
+   - Complete request body is buffered and sent to workers
+   - Use for policies that need to inspect or transform the entire request body (validation, content filtering, body transformation)
+   - Higher latency due to complete body buffering
+   - Policies execute: **Body processing function with complete body**
+
+3. **`streaming`** - Execute policies with streaming body support
+   - Policies are executed in the defined configuration order
+   - Policies can implement two functions:
+     1. **Header processing function** - called once during `ProcessingRequest_RequestHeaders`
+     2. **Stream body processing function** - called for each chunk during `ProcessingRequest_RequestBody`
+   - If a policy implements both functions:
+     - First execution: During `ProcessingRequest_RequestHeaders` (header processing)
+     - Subsequent executions: Once per streamed body chunk during `ProcessingRequest_RequestBody`
+   - Use for policies that need to process large request bodies without buffering the entire content
+   - Optimizes latency and memory usage for large payloads
+   - Example: Virus scanning, content filtering, or streaming transformations
+
+4. **`auto`** - Automatically determine the optimal processing mode **(default)**
+   - Policy Kernel analyzes the policies in the chain and their capabilities
+   - If all policies only implement header processing → uses `headers_only`
+   - If any policy requires complete body → uses `buffered_body`
+   - If policies support streaming → uses `streaming`
+   - Default behavior when `processing_mode` is not specified
+   - Recommended for most use cases
+
+**Policy Execution Flow by Mode:**
+
+```
+headers_only mode:
+  ProcessingRequest_RequestHeaders:
+    → policy1.ProcessHeaders()
+    → policy2.ProcessHeaders()
+    → policy3.ProcessHeaders()
+
+buffered_body mode:
+  ProcessingRequest_RequestBody:
+    → policy1.ProcessBody(completeBody)
+    → policy2.ProcessBody(completeBody)
+    → policy3.ProcessBody(completeBody)
+
+streaming mode (policy2 implements both interfaces):
+  ProcessingRequest_RequestHeaders:
+    → policy1.ProcessHeaders()
+    → policy2.ProcessHeaders()  ← First execution
+    → policy3.ProcessHeaders()
+
+  ProcessingRequest_RequestBody (chunk 1):
+    → policy1.ProcessStreamChunk(chunk1)
+    → policy2.ProcessStreamChunk(chunk1)  ← Second execution
+    → policy3.ProcessStreamChunk(chunk1)
+
+  ProcessingRequest_RequestBody (chunk 2):
+    → policy1.ProcessStreamChunk(chunk2)
+    → policy2.ProcessStreamChunk(chunk2)  ← Third execution
+    → policy3.ProcessStreamChunk(chunk2)
+
+  ProcessingRequest_RequestBody (chunk N):
+    → policy1.ProcessStreamChunk(chunkN)
+    → policy2.ProcessStreamChunk(chunkN)  ← N+1 execution
+    → policy3.ProcessStreamChunk(chunkN)
+```
+
+**Processing Mode Selection Guidelines:**
+
+| Policy Type | Recommended Mode | Rationale |
+|-------------|------------------|-----------|
+| Authentication (API key, JWT) | `headers_only` | Credentials typically in headers |
+| Rate limiting | `headers_only` | Based on client ID/IP in headers |
+| Request routing/rewriting | `headers_only` | Path/header based decisions |
+| Small request body validation | `buffered_body` | Needs complete body content |
+| Content transformation | `buffered_body` | Modifies entire request body |
+| Large file upload validation | `streaming` | Process chunks without buffering |
+| Virus scanning | `streaming` | Scan content as it streams |
+
+**Response Flow Processing Modes:**
+
+The same processing modes (`headers_only`, `buffered_body`, `streaming`, `auto`) apply to `response_flow` for handling response data from upstream services.
+
+**Response Processing Mode Use Cases:**
+
+1. **`headers_only`** - Response header manipulation only
+   - Add security headers (CORS, CSP, X-Frame-Options)
+   - Response header-based routing decisions
+   - Logging/metrics based on response headers
+   - Lowest latency as body is not processed
+
+2. **`buffered_body`** - Complete response body processing
+   - Response body transformation (format conversion, encryption)
+   - Response validation against schemas
+   - Content filtering on complete responses
+   - Suitable for small to medium response payloads
+
+3. **`streaming`** - Real-time response chunk processing
+   - **Server-Sent Events (SSE)**: Streaming responses from AI APIs, real-time data feeds
+   - **Streaming guardrails**: Content moderation, PII filtering on AI-generated content
+   - **Large file downloads**: Virus scanning, content transformation without buffering
+   - Policies execute once during `ProcessingResponse_ResponseHeaders`, then once per body chunk
+   - Optimal for latency-sensitive streaming applications
+
+4. **`auto`** (default) - Kernel determines optimal mode based on policy capabilities
+
+**Example Configurations:**
+
+```yaml
+# Headers-only mode for authentication and rate limiting
+- route_name: "/api/v1/users"
+  request_flow:
+    processing_mode: "headers_only"  # Default is "auto"
+    policy_chain:
+      - policy: "apiKeyAuth"
+      - policy: "rateLimit"
+
+# Buffered body mode for request validation
+- route_name: "/api/v1/data"
+  request_flow:
+    processing_mode: "buffered_body"
+    policy_chain:
+      - policy: "jsonSchemaValidation"
+      - policy: "contentFilter"
+
+# Streaming mode for large file uploads
+- route_name: "/api/v1/upload"
+  request_flow:
+    processing_mode: "streaming"
+    policy_chain:
+      - policy: "jwtAuth"           # Executes once in headers phase
+      - policy: "virusScan"         # Executes once in headers phase, then once per body chunk
+      - policy: "fileSizeLimit"     # Executes once per body chunk
+
+# Auto mode (default) - let the kernel decide
+- route_name: "/api/v1/endpoint"
+  request_flow:
+    # processing_mode defaults to "auto" if not specified
+    policy_chain:
+      - policy: "authentication"
+      - policy: "validation"
+
+# Streaming mode for AI API with SSE response guardrails
+- route_name: "/api/v1/ai/chat"
+  request_flow:
+    processing_mode: "buffered_body"
+    policy_chain:
+      - policy: "apiKeyAuth"
+      - policy: "requestValidation"
+  response_flow:
+    processing_mode: "streaming"  # Stream response chunks for real-time processing
+    policy_chain:
+      - policy: "contentModerationGuardrail"  # Filter inappropriate content in real-time
+      - policy: "piiRedaction"                # Redact PII from streamed response
+      - policy: "usageMetering"               # Track token usage per chunk
+
+# Response headers-only mode for security headers
+- route_name: "/api/v1/public"
+  request_flow:
+    processing_mode: "headers_only"
+    policy_chain:
+      - policy: "rateLimit"
+  response_flow:
+    processing_mode: "headers_only"  # Only modify response headers
+    policy_chain:
+      - policy: "addSecurityHeaders"
+      - policy: "corsHeaders"
+```
+
+### 4.3 Startup Configuration Validation
 
 On startup and reload (static YAML configuration):
 1. Validate YAML syntax
@@ -449,7 +636,7 @@ stateDiagram-v2
 1. Extract `route_name` from Envoy request headers or metadata
 2. Lookup route in `route_policies` configuration
 3. **Route Not Found**: If route not found, return `CONTINUE` instruction to Envoy (no policy execution)
-4. **All-or-Nothing Validation (Both Phases)**: Validate **BOTH** request and response phase policy chains upfront to fail fast. For each policy in **both** `request_policy_chain` and `response_policy_chain`, perform two-stage validation:
+4. **All-or-Nothing Validation (Both Phases)**: Validate **BOTH** request and response phase policy chains upfront to fail fast. For each policy in **both** `request_flow.policy_chain` and `response_flow.policy_chain`, perform two-stage validation:
 
    **Stage 1: Check if policy is supported by ANY worker**
    - Query worker registry to find if ANY worker (healthy or unhealthy) declares support for this policy
