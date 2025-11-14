@@ -505,13 +505,17 @@ sequenceDiagram
     Kernel->>Worker1: GetWorkerConfigRequest
     Worker1-->>Kernel: GetWorkerConfigResponse<br/>(name, version, policies)
 
-    Note over Kernel: Update Worker Registry<br/>- Worker info<br/>- Supported policies<br/>- Connection handle
+    Note over Kernel: Update Worker Registry<br/>- Worker info<br/>- Supported policies<br/>- Connection handle<br/>- Validate policy uniqueness
 
     Kernel->>WorkerN: Connect to UDS socket
     Kernel->>WorkerN: GetWorkerConfigRequest
     WorkerN-->>Kernel: GetWorkerConfigResponse<br/>(name, version, policies)
 
-    Note over Kernel: Update Worker Registry
+    Note over Kernel: Update Worker Registry<br/>- Validate policy uniqueness
+
+    alt Policy conflict detected
+        Note over Kernel: Log critical error<br/>Reject worker registration<br/>Mark conflicting policies invalid
+    end
 
     Note over Kernel: Startup Phase 2:<br/>Load Route Policies
 
@@ -528,11 +532,57 @@ sequenceDiagram
     end
 ```
 
-### 5.3 Worker Registry Structure
+### 5.3 Policy Uniqueness Constraint
+
+**IMPORTANT CONSTRAINT**: Each policy can only be supported by **ONE unique worker ID**. However, multiple replicas of the same worker (with the same worker name/ID) can support the same policy for horizontal scaling.
+
+**Rules:**
+- ❌ Different workers (different worker names) CANNOT support the same policy
+- ✅ Worker replicas (same worker name) CAN support the same policy
+- ✅ A single worker CAN support multiple different policies
+
+**Rationale:**
+1. **Clear Ownership**: Each policy has a single authoritative worker implementation
+2. **Horizontal Scaling**: Worker replicas enable load distribution without policy conflicts
+3. **Simplified Routing**: No ambiguity about which worker handles a given policy
+4. **Configuration Safety**: Prevents accidental policy conflicts during deployment
+
+**Validation During Discovery:**
+
+When a worker registers and declares its supported policies, the kernel MUST validate that no other worker with a **different name** has already registered support for the same policy. If a conflict is detected:
+- Log a critical error with details (policy name, existing owner, conflicting worker)
+- Reject the new worker's registration
+- Mark the conflicting policy as invalid for route validation
+
+**Valid Scenario - Worker Replicas:**
+```
+Worker: "auth-worker" (replica 1) at /var/run/workers/auth-1.sock
+  Supports: [apiKeyAuth, jwtValidation]
+
+Worker: "auth-worker" (replica 2) at /var/run/workers/auth-2.sock
+  Supports: [apiKeyAuth, jwtValidation]
+
+✅ ALLOWED - Same worker name (replicas)
+```
+
+**Invalid Scenario - Different Workers:**
+```
+Worker: "auth-worker-v1" at /var/run/workers/auth-v1.sock
+  Supports: [jwtValidation]
+
+Worker: "auth-worker-v2" at /var/run/workers/auth-v2.sock
+  Supports: [jwtValidation]
+
+❌ REJECTED - Different worker names cannot support the same policy
+Error: "policy 'jwtValidation' already registered by worker 'auth-worker-v1'"
+```
+
+### 5.4 Worker Registry Structure
 
 ```go
 type WorkerRegistry struct {
     workers map[string]*WorkerEntry
+    policyOwners map[string]string  // policy name -> worker name (enforces uniqueness)
     mu     sync.RWMutex
 }
 
@@ -547,7 +597,7 @@ type WorkerEntry struct {
 }
 ```
 
-### 5.4 Health Checking
+### 5.5 Health Checking
 
 Periodic health checks for each worker:
 
@@ -695,13 +745,16 @@ Execution Plan:
 
 ### 6.4 Worker Selection Strategy
 
-When multiple workers support the same policy, the kernel uses the following selection strategy:
+**Policy-to-Worker Mapping**: Due to the policy uniqueness constraint (see section 5.3), each policy is supported by exactly ONE unique worker name. When a policy needs to be executed, the kernel:
 
-**Selection Priority:**
-1. **Health Status**: Only consider healthy workers
-2. **Worker Grouping**: Prefer grouping consecutive policies on the same worker to minimize calls
-3. **Load Balancing**: Distribute load across workers (if multiple workers support the same policies)
-4. **Configuration Preference**: If explicitly configured in route policy, use the specified worker
+1. **Identifies the Worker**: Looks up the single worker name that supports the policy
+2. **Selects a Healthy Replica**: If multiple replicas exist for that worker, selects a healthy one
+3. **Load Balancing**: Distributes requests across healthy replicas of the same worker
+
+**Replica Selection Priority:**
+1. **Health Status**: Only consider healthy worker replicas
+2. **Load Balancing**: Distribute load across healthy replicas (round-robin, least-connections, etc.)
+3. **Affinity** (optional): Sticky sessions for stateful policies
 
 **Optimization: Policy Chain Grouping**
 
@@ -725,76 +778,6 @@ Optimized Plan (3 calls):
 1. auth-worker: [auth1, auth2]
 2. rate-limiter: [rateLimit]
 3. auth-worker: [auth3]
-```
-
-**Worker Selection Algorithm:**
-
-**Note**: This function is called **twice during request phase processing** - once for request phase policies and once for response phase policies. If either call fails validation (returns error), the entire request is rejected with an appropriate error response.
-
-```go
-func (k *Kernel) createExecutionPlan(policies []*Policy) ([]WorkerPolicyGroup, error) {
-    // Stage 1: Check if ALL policies are supported by at least one worker (configuration check)
-    for _, policy := range policies {
-        allWorkers := k.registry.FindWorkersForPolicy(policy.Name, false /* includeUnhealthy */)
-        if len(allWorkers) == 0 {
-            // Configuration error: No worker (healthy or unhealthy) supports this policy
-            return nil, &PolicyNotSupportedError{
-                PolicyName: policy.Name,
-                Message: fmt.Sprintf("no worker declares support for policy: %s", policy.Name),
-            }
-        }
-    }
-
-    // Stage 2: Check if supporting workers are healthy (availability check)
-    for _, policy := range policies {
-        healthyWorkers := k.registry.FindWorkersForPolicy(policy.Name, true /* healthyOnly */)
-        if len(healthyWorkers) == 0 {
-            // Temporary unavailability: Policy supported but all workers unhealthy
-            unhealthyWorkers := k.registry.FindWorkersForPolicy(policy.Name, false /* includeUnhealthy */)
-            return nil, &WorkerUnavailableError{
-                PolicyName: policy.Name,
-                UnavailableWorkers: unhealthyWorkers,
-                Message: fmt.Sprintf("all workers supporting policy %s are unhealthy", policy.Name),
-            }
-        }
-    }
-
-    // Stage 3: Create execution plan (grouping optimization)
-    plan := []WorkerPolicyGroup{}
-    var currentGroup *WorkerPolicyGroup
-
-    for _, policy := range policies {
-        // Find all healthy workers supporting this policy (guaranteed to exist after Stage 2)
-        workers := k.registry.FindWorkersForPolicy(policy.Name, true /* healthyOnly */)
-
-        // Try to extend current group if same worker can handle this policy
-        if currentGroup != nil && currentGroup.Worker.SupportsPolicy(policy.Name) {
-            currentGroup.Policies = append(currentGroup.Policies, policy)
-        } else {
-            // Start new group with first available worker
-            worker := workers[0] // Could apply load balancing here
-            currentGroup = &WorkerPolicyGroup{
-                Worker:    worker,
-                Policies: []*Policy{policy},
-            }
-            plan = append(plan, *currentGroup)
-        }
-    }
-
-    return plan, nil
-}
-
-// Error types for distinguishing failure modes
-type PolicyNotSupportedError struct {
-    PolicyName string
-    Message    string
-}
-
-type WorkerUnavailableError struct {
-    PolicyName        string
-    UnavailableWorkers []*WorkerEntry
-    Message           string
-}
 ```
 
 ### 6.5 All-or-Nothing Policy Validation
